@@ -5,6 +5,7 @@
       <span class="ariane" @click="resetMenu()">Retour à l'accueil</span>
     </span>
     <span v-if="!menuOption">
+      <sync-list />
       <menu-widget />
     </span>
     <div v-if="menuOption === 'publier'">
@@ -31,10 +32,11 @@ import SchemaForm from './SchemaForm.vue';
 import ImporterForm from './ImporterForm.vue';
 import { useStore } from 'vuex';
 import ValidataWidget from '../validata/ValidataWidget.vue';
+import SyncList from './SyncList.vue';
 
 export default defineComponent({
   name: 'GristWidget',
-  components: { HeaderWidget, MenuWidget, PublierForm, SchemaForm, ImporterForm, ValidataWidget },
+  components: { HeaderWidget, MenuWidget, PublierForm, SchemaForm, ImporterForm, ValidataWidget, SyncList },
   setup() {
 
     const store = useStore();

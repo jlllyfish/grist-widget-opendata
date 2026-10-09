@@ -104,9 +104,27 @@
     <div v-if="currentStep === 'selectKey'">
     <!-- 3bis/ mode upsert : choix de la ou des colonnes servant de clé de rapprochement -->
         <fieldset class="fr-fieldset">
+            <legend class="fr-fieldset__legend--regular fr-fieldset__legend">Comment reconnaître une ligne d'un import à l'autre ?</legend>
+            <div class="fr-fieldset__element">
+                <div class="fr-radio-group">
+                    <input type="radio" id="keymode-columns" value="columns" v-model="keyMode">
+                    <label class="fr-label" for="keymode-columns">Par une ou plusieurs colonnes de la source</label>
+                </div>
+            </div>
+            <div class="fr-fieldset__element">
+                <div class="fr-radio-group">
+                    <input type="radio" id="keymode-hash" value="hash" v-model="keyMode">
+                    <label class="fr-label" for="keymode-hash">
+                        La source n'a pas d'identifiant : générer une clé
+                        <span class="fr-hint-text">Une empreinte du contenu de chaque ligne est stockée dans {{ HASH_COL }}. Une ligne modifiée dans la source est remplacée par une nouvelle ligne, et les lignes disparues sont supprimées.</span>
+                    </label>
+                </div>
+            </div>
+        </fieldset>
+        <fieldset v-if="keyMode === 'columns'" class="fr-fieldset">
             <legend class="fr-fieldset__legend--regular fr-fieldset__legend">
                 Colonne(s) identifiant de manière unique une ligne
-                <span class="fr-hint-text">Ex. : SIRET, code INSEE, identifiant d'établissement. Plusieurs colonnes = clé composite.</span>
+                <span class="fr-hint-text">Ex. : SIRET, code INSEE, identifiant d'établissement. Cochez plusieurs colonnes si c'est leur combinaison qui est unique.</span>
             </legend>
             <div v-for="col in availableColumns" :key="col" class="fr-fieldset__element">
                 <div class="fr-checkbox-group">
@@ -115,11 +133,11 @@
                 </div>
             </div>
         </fieldset>
-        <div class="fr-checkbox-group fr-mb-2w">
+        <div v-if="keyMode === 'columns'" class="fr-checkbox-group fr-mb-2w">
             <input type="checkbox" id="delete-missing" v-model="deleteMissing">
             <label class="fr-label" for="delete-missing">Supprimer les lignes de la table absentes de la source</label>
         </div>
-        <button class="fr-btn" :disabled="keyColumns.length === 0" @click="confirmUpsert">Lancer la mise à jour</button>
+        <button class="fr-btn" :disabled="keyMode === 'columns' && keyColumns.length === 0" @click="confirmUpsert">Lancer la mise à jour</button>
     </div>
 
     <div>
@@ -139,6 +157,7 @@
         <p v-if="upsertStats" class="fr-text--sm fr-mt-1w">
             {{ upsertStats.rows }} lignes source traitées<span v-if="upsertStats.removed !== null">, {{ upsertStats.removed }} lignes supprimées</span>.
             <span v-if="upsertStats.truncated"> Import limité à {{ MAX_PAGES }} pages : suppression des lignes absentes non effectuée.</span>
+            <br />Synchronisation mémorisée : la prochaine fois, utilisez le bouton « Mettre à jour » sur l'accueil du widget.
         </p>
     </div>
 
@@ -150,6 +169,7 @@
 import { defineComponent, computed, onMounted, ref } from 'vue';
 import { useStore } from 'vuex';
 import { processString } from '@/utils';
+import { MAJ_COL, HASH_COL, MAX_PAGES, toGristColId, runSync, type KeyMode, type SyncStats } from './sync';
 
 
 interface Resource {
@@ -159,19 +179,6 @@ interface Resource {
   resource_title: any;
   organization_name?: any;
 }
-
-// Colonne horodatée par Grist (formule déclenchée NOW()) : mise à jour seulement quand une valeur de la ligne change réellement
-const MAJ_COL = "maj_datagouv";
-const MAX_PAGES = 50;      // même plafond que le mode remplacement (≈ 10 000 lignes)
-const PAGE_SIZE = 200;
-const RECALC_MANUAL_UPDATES = 2; // RecalcWhen.MANUAL_UPDATES côté Grist
-
-// Grist préfixe par "c" les identifiants de colonne commençant par un chiffre
-const toGristColId = (key: string) => {
-  const k = processString(key);
-  return /^\d/.test(k) ? "c" + k : k;
-};
-const toCell = (v: any) => (v === null || v === undefined ? null : String(v));
 
 function debounce<T extends () => void>(fn: T, delay: number): () => void {
   let timeoutID: number;
@@ -203,8 +210,10 @@ export default defineComponent({
     const pendingResourceId = ref<string | null>(null)
     const availableColumns = ref<string[]>([])
     const keyColumns = ref<string[]>([])
+    const keyMode = ref<KeyMode>("columns")
+    const pendingResourceTitle = ref("")
     const deleteMissing = ref(false)
-    const upsertStats = ref<{ rows: number; removed: number | null; truncated: boolean } | null>(null)
+    const upsertStats = ref<SyncStats | null>(null)
     const datagouvUrl = import.meta.env.VUE_APP_DATAGOUV_IMPORT_URL
     const tabularapiUrl = import.meta.env.VUE_APP_DATAGOUV_TABULAR_API
     let gristUrl = ""
@@ -388,6 +397,8 @@ export default defineComponent({
                     .map(toGristColId)
                     .filter((k) => k !== "id");
                 keyColumns.value = [];
+                const r = resources.value.find((x) => x.resource_id === id);
+                pendingResourceTitle.value = r ? `${r.dataset_title} — ${r.resource_title}` : id;
                 pendingResourceId.value = id;
                 showLoader.value = false;
                 return;
@@ -514,110 +525,19 @@ export default defineComponent({
         isImported.value = true
     };
 
-    const getRawSectionParentId = async (token: string) => {
-        const resp = await fetch(gristUrl + "/api/docs/" + store.state.docId + "/tables/?auth=" + token);
-        if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
-        const tables = await resp.json();
-        const t = tables.tables.find((tb: { id: string }) => tb.id === selectedTable.value);
-        return t ? t.fields.rawViewSectionRef - 1 : 1; // même logique que le mode remplacement
-    };
-
     const runUpsert = async (id: string) => {
-        const docApi = window.grist.docApi;
-        const table = selectedTable.value;
-        const keys = [...keyColumns.value];
         urlError.value = "";
         upsertStats.value = null;
         showLoader.value = true;
-        ongoingStep.value = 2;
-
         try {
-            // 1. Colonnes : on conserve l'existant, on n'ajoute que ce qui manque
-            const existingCols = new Set(Object.keys(await docApi.fetchTable(table)));
-            const tokenInfo = await docApi.getAccessToken({ readOnly: true });
-            const parentId = await getRawSectionParentId(tokenInfo.token);
-
-            const addColumn = async (colId: string, colInfo: object): Promise<string> => {
-                const r = await docApi.applyUserActions([["AddColumn", table, colId, colInfo]]);
-                const ret = r.retValues[0];
-                await docApi.applyUserActions([["AddRecord", "_grist_Views_section_field", null, { parentPos: null, parentId, colRef: ret.colRef }]]);
-                existingCols.add(ret.colId);
-                return ret.colId;
-            };
-
-            if (!existingCols.has(MAJ_COL)) {
-                // Formule déclenchée : NOW() recalculé à la création de la ligne et à chaque modification réelle d'une de ses cellules.
-                // Grist ignore les mises à jour sans changement de valeur, donc une ligne identique garde son horodatage.
-                await addColumn(MAJ_COL, {
-                    type: "DateTime:Europe/Paris",
-                    isFormula: false,
-                    formula: "NOW()",
-                    recalcWhen: RECALC_MANUAL_UPDATES,
-                });
-            }
-            ongoingStep.value = 3;
-
-            // 2. Pages de l'API tabulaire → BulkAddOrUpdateRecord
-            const colIdOf: Record<string, string> = {}; // nom source -> id de colonne Grist
-            const seen = new Set<string>();
-            let rows = 0;
-            let totalPages = 1;
-
-            for (let page = 1; page <= Math.min(totalPages, MAX_PAGES); page++) {
-                const resp = await fetch(`${tabularapiUrl}/api/resources/${id}/data/?page_size=${PAGE_SIZE}&page=${page}`);
-                if (!resp.ok) throw new Error(`Erreur API tabulaire (${resp.status}).`);
-                const result = await resp.json();
-                totalPages = Math.max(1, Math.ceil((result.meta?.total ?? 0) / PAGE_SIZE));
-                ongoingStep.value = Math.min(8, 3 + Math.floor((page * 5) / Math.min(totalPages, MAX_PAGES)));
-                const data: any[] = result.data ?? [];
-                if (data.length === 0) break;
-
-                for (const item of data) {
-                    for (const src of Object.keys(item)) {
-                        if (src === "__id" || src in colIdOf) continue;
-                        const colId = toGristColId(src);
-                        if (colId === "id") continue;
-                        colIdOf[src] = existingCols.has(colId)
-                            ? colId
-                            : await addColumn(colId, { isFormula: true, type: "Any", formula: "" });
-                    }
-                }
-                const missingKeys = keys.filter((k) => !Object.values(colIdOf).includes(k));
-                if (missingKeys.length) throw new Error(`Colonne(s) clé introuvable(s) : ${missingKeys.join(", ")}`);
-
-                const require: Record<string, any[]> = Object.fromEntries(keys.map((k) => [k, []]));
-                const values: Record<string, any[]> = {};
-                for (const item of data) {
-                    const rowKey: any[] = [];
-                    for (const [src, colId] of Object.entries(colIdOf)) {
-                        const v = toCell(item[src]);
-                        if (keys.includes(colId)) {
-                            require[colId].push(v);
-                        } else {
-                            (values[colId] ??= []).push(v);
-                        }
-                    }
-                    for (const k of keys) rowKey.push(require[k][require[k].length - 1]);
-                    seen.add(JSON.stringify(rowKey));
-                }
-
-                await docApi.applyUserActions([["BulkAddOrUpdateRecord", table, require, values, { on_many: "first" }]]);
-                rows += data.length;
-            }
-
-            // 3. Optionnel : suppression des lignes disparues de la source (seulement si on a tout lu)
-            const truncated = totalPages > MAX_PAGES;
-            let removed: number | null = null;
-            if (deleteMissing.value && !truncated) {
-                const current = await docApi.fetchTable(table);
-                const toRemove = (current.id as number[]).filter(
-                    (_, i) => !seen.has(JSON.stringify(keys.map((k) => current[k][i])))
-                );
-                if (toRemove.length) await docApi.applyUserActions([["BulkRemoveRecord", table, toRemove]]);
-                removed = toRemove.length;
-            }
-
-            upsertStats.value = { rows, removed, truncated };
+            upsertStats.value = await runSync({
+                table: selectedTable.value,
+                resourceId: id,
+                resourceTitle: pendingResourceTitle.value,
+                keyMode: keyMode.value,
+                keys: [...keyColumns.value],
+                deleteMissing: deleteMissing.value,
+            }, (step) => { ongoingStep.value = step; });
             isImported.value = true;
         } catch (e: any) {
             console.error(e);
@@ -685,6 +605,8 @@ export default defineComponent({
         importMode,
         availableColumns,
         keyColumns,
+        keyMode,
+        HASH_COL,
         deleteMissing,
         confirmUpsert,
         upsertStats,
