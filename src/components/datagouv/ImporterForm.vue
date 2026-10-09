@@ -157,8 +157,11 @@
         <p v-if="upsertStats" class="fr-text--sm fr-mt-1w">
             {{ upsertStats.rows }} lignes source traitées<span v-if="upsertStats.removed !== null">, {{ upsertStats.removed }} lignes supprimées</span>.
             <span v-if="upsertStats.truncated"> Import limité à {{ MAX_PAGES }} pages : suppression des lignes absentes non effectuée.</span>
-            <br />Synchronisation mémorisée : la prochaine fois, utilisez le bouton « Mettre à jour » sur l'accueil du widget.
         </p>
+        <div v-if="configSaved" class="fr-alert fr-alert--info fr-alert--sm fr-mt-2w">
+            <p>Pour mémoriser cette synchronisation, cliquez sur <strong>Enregistrer</strong> en haut du widget (une seule fois). Ensuite, le bouton « Mettre à jour » de l'accueil suffit.</p>
+        </div>
+        <button class="fr-btn fr-btn--secondary fr-btn--icon-left fr-icon-arrow-left-line fr-mt-2w" @click="goHome">Retour à l'accueil</button>
     </div>
 
 
@@ -169,7 +172,7 @@
 import { defineComponent, computed, onMounted, ref } from 'vue';
 import { useStore } from 'vuex';
 import { processString } from '@/utils';
-import { MAJ_COL, HASH_COL, MAX_PAGES, toGristColId, runSync, type KeyMode, type SyncStats } from './sync';
+import { MAJ_COL, HASH_COL, MAX_PAGES, toGristColId, runSync, saveSyncIfChanged, type KeyMode, type SyncConfig, type SyncStats } from './sync';
 
 
 interface Resource {
@@ -214,6 +217,8 @@ export default defineComponent({
     const pendingResourceTitle = ref("")
     const deleteMissing = ref(false)
     const upsertStats = ref<SyncStats | null>(null)
+    const configSaved = ref(false)
+    const goHome = () => store.dispatch('updateMenuOption', null)
     const datagouvUrl = import.meta.env.VUE_APP_DATAGOUV_IMPORT_URL
     const tabularapiUrl = import.meta.env.VUE_APP_DATAGOUV_TABULAR_API
     let gristUrl = ""
@@ -530,14 +535,16 @@ export default defineComponent({
         upsertStats.value = null;
         showLoader.value = true;
         try {
-            upsertStats.value = await runSync({
+            const cfg: SyncConfig = {
                 table: selectedTable.value,
                 resourceId: id,
                 resourceTitle: pendingResourceTitle.value,
                 keyMode: keyMode.value,
                 keys: [...keyColumns.value],
                 deleteMissing: deleteMissing.value,
-            }, (step) => { ongoingStep.value = step; });
+            };
+            upsertStats.value = await runSync(cfg, (step) => { ongoingStep.value = step; });
+            configSaved.value = await saveSyncIfChanged(cfg);
             isImported.value = true;
         } catch (e: any) {
             console.error(e);
@@ -610,6 +617,8 @@ export default defineComponent({
         deleteMissing,
         confirmUpsert,
         upsertStats,
+        configSaved,
+        goHome,
         MAJ_COL,
         MAX_PAGES,
     }

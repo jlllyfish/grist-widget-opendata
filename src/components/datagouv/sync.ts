@@ -20,7 +20,6 @@ export interface SyncConfig {
   keyMode: KeyMode;
   keys: string[]; // colonnes Grist servant de clé (mode 'columns')
   deleteMissing: boolean;
-  lastRun?: string; // ISO
 }
 
 export interface SyncStats {
@@ -77,6 +76,26 @@ export async function saveSync(cfg: SyncConfig): Promise<void> {
   const all = await loadSyncs();
   all[cfg.table] = plain(cfg);
   await window.grist.setOption(OPTION_KEY, plain(all));
+}
+
+// Toute écriture dans les options fait apparaître le bouton « Enregistrer » de Grist :
+// on n'enregistre la config que si elle a réellement changé.
+export async function saveSyncIfChanged(cfg: SyncConfig): Promise<boolean> {
+  const all = await loadSyncs();
+  if (JSON.stringify(all[cfg.table]) === JSON.stringify(plain(cfg))) return false;
+  await saveSync(cfg);
+  return true;
+}
+
+// Date du dernier passage : stockée dans le navigateur pour ne pas modifier le document à chaque mise à jour
+const lastRunKey = (docId: string, table: string) => `datagouv-sync:${docId}:${table}`;
+
+export async function getLastRun(table: string): Promise<string | null> {
+  try {
+    return localStorage.getItem(lastRunKey(await window.grist.docApi.getDocName(), table));
+  } catch {
+    return null;
+  }
 }
 
 export async function removeSync(table: string): Promise<void> {
@@ -203,6 +222,10 @@ export async function runSync(
     removed = toRemove.length;
   }
 
-  await saveSync({ ...cfg, lastRun: new Date().toISOString() });
+  try {
+    localStorage.setItem(lastRunKey(ctx.docId, table), new Date().toISOString());
+  } catch {
+    /* stockage navigateur indisponible : sans conséquence */
+  }
   return { rows, removed, truncated };
 }

@@ -9,7 +9,7 @@
             {{ s.resourceTitle || s.resourceId }}<br />
             <span class="fr-text--xs">
               Clé : {{ s.keyMode === 'hash' ? 'empreinte générée' : s.keys.join(' + ') }}
-              · Dernière mise à jour : {{ s.lastRun ? formatDate(s.lastRun) : 'jamais' }}
+              · Dernière mise à jour : {{ lastRuns[s.table] ? formatDate(lastRuns[s.table]) : '—' }}
             </span>
           </p>
           <p v-if="status[s.table]" class="fr-text--sm fr-mb-1w" :class="{ 'fr-error-text': errors[s.table] }">
@@ -37,7 +37,7 @@
 
 <script lang="ts">
 import { defineComponent, onMounted, ref } from 'vue';
-import { loadSyncs, removeSync, runSync, type SyncConfig } from './sync';
+import { getLastRun, loadSyncs, removeSync, runSync, type SyncConfig } from './sync';
 
 export default defineComponent({
   name: 'SyncList',
@@ -46,9 +46,14 @@ export default defineComponent({
     const running = ref<string | null>(null);
     const status = ref<Record<string, string>>({});
     const errors = ref<Record<string, boolean>>({});
+    const lastRuns = ref<Record<string, string>>({});
 
     const reload = async () => {
       syncs.value = Object.values(await loadSyncs());
+      for (const s of syncs.value) {
+        const d = await getLastRun(s.table);
+        if (d) lastRuns.value[s.table] = d;
+      }
     };
 
     const formatDate = (iso: string) =>
@@ -84,7 +89,7 @@ export default defineComponent({
 
     onMounted(reload);
 
-    return { syncs, running, status, errors, refresh, forget, formatDate };
+    return { syncs, running, status, errors, lastRuns, refresh, forget, formatDate };
   },
 });
 </script>

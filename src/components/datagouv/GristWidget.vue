@@ -2,7 +2,7 @@
   <header-widget />
   <div>
     <span v-if="menuOption">
-      <span class="ariane" @click="resetMenu()">Retour à l'accueil</span>
+      <button class="fr-btn fr-btn--tertiary fr-btn--sm fr-btn--icon-left fr-icon-arrow-left-line fr-mb-2w" @click="resetMenu()">Retour à l'accueil</button>
     </span>
     <span v-if="!menuOption">
       <sync-list />
