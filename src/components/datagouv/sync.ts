@@ -70,16 +70,19 @@ export async function loadSyncs(): Promise<Record<string, SyncConfig>> {
   }
 }
 
+// Les objets réactifs de Vue (Proxy) ne passent pas le postMessage vers Grist : on envoie toujours une copie simple
+const plain = <T>(v: T): T => JSON.parse(JSON.stringify(v));
+
 export async function saveSync(cfg: SyncConfig): Promise<void> {
   const all = await loadSyncs();
-  all[cfg.table] = cfg;
-  await window.grist.setOption(OPTION_KEY, all);
+  all[cfg.table] = plain(cfg);
+  await window.grist.setOption(OPTION_KEY, plain(all));
 }
 
 export async function removeSync(table: string): Promise<void> {
   const all = await loadSyncs();
   delete all[table];
-  await window.grist.setOption(OPTION_KEY, all);
+  await window.grist.setOption(OPTION_KEY, plain(all));
 }
 
 // --- Synchronisation ---
@@ -93,9 +96,10 @@ async function getRawSectionParentId(ctx: SyncContext, table: string, token: str
 }
 
 export async function runSync(
-  cfg: SyncConfig,
+  cfgIn: SyncConfig,
   onProgress: (step: number) => void = () => {},
 ): Promise<SyncStats> {
+  const cfg = plain(cfgIn);
   const ctx = await getContext();
   const docApi = window.grist.docApi;
   const table = cfg.table;
