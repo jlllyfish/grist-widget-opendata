@@ -1,5 +1,5 @@
 {
-  "name": "my-grist-app",
+  "name": "grist-widget-datagouv-sync",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,17 +12,10 @@
   },
   "dependencies": {
     "@gouvfr/dsfr": "1.14.4",
-    "@gouvminint/vue-dsfr": "^8.20.0",
-    "@iconify/vue": "^5.0.3",
-    "axios": "1.20.0",
-    "papaparse": "^5.5.2",
-    "vue": "^3.5.27",
-    "vue-router": "5.3.1",
-    "vuex": "^4.0.2"
+    "vue": "^3.5.27"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
-    "@types/papaparse": "^5.3.15",
     "@vitejs/plugin-vue": "^6.0.9",
     "@vue/eslint-config-typescript": "^14.9.0",
     "eslint": "^9.39.5",

@@ -1,27 +1,34 @@
 <template>
-  <div id="app" class="fr-container fr-mt-3w fr-mb-3w">
-    <router-view />
+  <div class="widget">
+    <AppHeader />
+    <HomeView v-if="view === 'home'" :key="homeKey" @import="view = 'import'" />
+    <ImportWizard v-else @home="goHome" />
   </div>
 </template>
 
-<script lang="ts">
-import { defineComponent } from "vue";
+<script setup lang="ts">
+import { ref } from 'vue';
+import AppHeader from './components/AppHeader.vue';
+import HomeView from './components/HomeView.vue';
+import ImportWizard from './components/ImportWizard.vue';
 
-export default defineComponent({
-  name: "App",
-  components: {},
-});
+// Accès complet : le widget crée des tables et des colonnes
+window.grist.ready({ requiredAccess: 'full' });
+
+const view = ref<'home' | 'import'>('home');
+const homeKey = ref(0); // force le rechargement de la liste au retour
+
+const goHome = () => {
+  homeKey.value++;
+  view.value = 'home';
+};
 </script>
 
-<style scoped>
-#app {
-  font-family: Marianne, Helvetica, Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-align: center;
-  color: #2c3e50;
-  width: 80%;
-  margin: auto;
+<style>
+.widget {
+  max-width: 48rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem;
   text-align: left;
 }
 </style>

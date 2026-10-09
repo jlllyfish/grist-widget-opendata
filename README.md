@@ -1,117 +1,47 @@
-# Plugin Grist data.gouv.fr
+# Synchronisation data.gouv.fr → Grist
 
-[Grist](https://www.getgrist.com/) est outil permettant de travailler sur des données et de construire des outils métiers avancés.
+Widget Grist qui importe une ressource tabulaire de [data.gouv.fr](https://www.data.gouv.fr) dans une table, puis la
+met à jour en un clic.
 
-Les équipes [data.gouv.fr](https://data.gouv.fr/) et [Validata](https://validata.fr/) ont développé un plugin Grist (« widget personnalisé ») permettant :
+Dérivé de [datagouv/grist-plugin-opendata](https://github.com/datagouv/grist-plugin-opendata), réduit à l'import.
 
-* de publier des données sur data.gouv.fr directement depuis Grist (onglet DataGouv)
-* de récupérer des données de data.gouv.fr pour les utiliser dans Grist  (onglet DataGouv)
-* de créer un template métier dans Grist à partir d’un schéma sur [schema.data.gouv.fr](https://schema.data.gouv.fr/)  (onglet DataGouv)
-* de vérifier directement dans Grist la validité de données par rapport à un schéma (onglet Validata)
+## Fonctionnement
 
-ℹ️ Grist est à disposition des agents publics via [la Suite numérique](https://lasuite.numerique.gouv.fr/) et [la Suite territoriale](https://suiteterritoriale.anct.gouv.fr/) :
+- **Import** : recherche d'un jeu de données (ou URL collée), choix d'une table nouvelle ou existante, puis d'une clé de
+  rapprochement.
+- **Mise à jour (upsert)** : les lignes sont rapprochées par la clé ; seules les lignes réellement modifiées changent.
+  - *Clé par colonnes* (SIRET, code INSEE, UAI…) : les lignes modifiées sont mises à jour sur place.
+  - *Clé générée* (source sans identifiant) : empreinte du contenu stockée dans `cle_datagouv` ; une ligne modifiée est
+    remplacée et les lignes disparues sont supprimées.
+- **Horodatage** : la colonne `maj_datagouv` (formule déclenchée `NOW()`) indique la date de création ou de dernière
+  modification de chaque ligne.
+- Les synchronisations sont mémorisées dans les options du widget (bouton « Enregistrer » de Grist, une fois) et
+  listées sur l'accueil avec un bouton « Mettre à jour ».
 
-⚠️ Ce plugin à destination des agents publics est en version _beta_.
+Limite : 50 pages de 200 lignes (10 000 lignes) par ressource.
 
-Toutes suggestion d'amélioration ou signalements de problèmes sont bienvenus sur [le forum data.gouv.fr](https://forum.data.gouv.fr/) ou au moyen de [tickets sur ce dépôt](https://github.com/datagouv/grist-plugin-opendata/issues).
+## Installation dans Grist
 
-## Onglet DataGouv
+Ajouter une vue *Widget personnalisé*, choisir *URL personnalisée* avec l'adresse du widget déployé, et donner au widget
+un **accès complet** au document.
 
-L'onglet DataGouv permet d'interagir avec data.gouv.fr directement depuis Grist.
-
-[Guide d'utilisation](./docs/datagouv.md)
-
-## Onglet Validata
-
-L'onglet validata permet de valider une table Grist avec un schéma au format Table Schema. 
-
-[Guide d'utilisation](./docs/validata.md).
-
-## Documentation technique
-
-### Démarrage rapide avec Docker (Recommandé) 🐳
-
-La manière la plus simple de développer avec ce plugin est d'utiliser Docker :
+## Développement
 
 ```bash
-# 1. Copier le fichier de configuration (première fois uniquement)
-cp .env.dev .env
-# Puis éditez le fichier .env pour configurer VUE_APP_DATAGOUV_CLIENT_ID si nécessaire
-
-# 2. Lancer Grist + Plugin avec hot-reload
-docker-compose up -d
-
-# 3. Voir les logs
-docker-compose logs -f
-
-# 4. Arrêter
-docker-compose down
-```
-
-Le plugin sera accessible sur http://localhost:8080 et Grist sur http://localhost:8484
-
-**Hot-reload activé** : Les modifications dans `src/` sont automatiquement rechargées !
-
-
-### Installation locale (Alternative)
-
-Il faut au préalable lancer grist en local (par exemple avec docker)
-
-```
-docker run -p 8484:8484 -it gristlabs/grist
-```
-
-```
 pnpm install
+pnpm dev        # http://localhost:8080, à utiliser comme URL de widget dans un Grist local
+pnpm lint
+pnpm build
 ```
 
-### Configuration du plugin
+Variables d'environnement facultatives (voir `.env.dev`) : `VUE_APP_DATAGOUV_IMPORT_URL`,
+`VUE_APP_DATAGOUV_TABULAR_API`.
 
-Dans un environnement de développement, récupérez la liste des variables d'environnement :
-```bash
-cp .env.dev .env
-```
+Le workflow `.github/workflows/pages.yml` publie le widget sur GitHub Pages à chaque push sur `main`.
 
-Et procédez aux adaptations `.env` comme décrit dans les commentaires.
+## Code
 
-Vite charge le fichier `.env` automatiquement, il n'y a rien à sourcer.
-
-### Compilation et _hot reload_ pour le développement
-
-```
-pnpm run dev
-```
-
-### Compilation et minification pour la production
-
-```
-pnpm run build
-```
-
-### Image Docker de production
-
-L'image servie par nginx se construit avec les mêmes variables, passées en
-`--build-arg` :
-
-```bash
-docker build -t grist-plugin-opendata \
-  --build-arg VUE_APP_VALIDATA_URL \
-  --build-arg VUE_APP_DATAGOUV_CLIENT_ID \
-  --build-arg VUE_APP_DATAGOUV_IMPORT_URL \
-  --build-arg VUE_APP_DATAGOUV_TABULAR_API \
-  --build-arg VUE_APP_GRIST_CHEAT_URL \
-  --build-arg VUE_APP_GRIST_URL \
-  --build-arg VUE_APP_DATAGOUV_PUBLISH_URL \
-  .
-```
-
-La construction échoue si une variable lue par le code est absente ou vide.
-
-### Analyse avec [ESLint](https://eslint.org/)
-```
-pnpm run lint
-```
-
-### Configuration personnalisée
-
-Voir [la documentation Vite](https://vite.dev/config/) et `vite.config.ts`.
+- `src/sync.ts` : moteur de synchronisation (colonnes, `BulkAddOrUpdateRecord`, suppressions, bilan, mémorisation).
+- `src/datagouv.ts` : recherche et résolution d'URL sur l'API data.gouv.fr.
+- `src/components/HomeView.vue` : accueil et mises à jour.
+- `src/components/ImportWizard.vue` : assistant d'import en 3 étapes.

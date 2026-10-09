@@ -25,13 +25,7 @@
         ></path>
       </svg>
     </div>
-    <!-- <div class="item-subpart">
-      <b>- Widgets Grist</b>
-    </div> -->
-
-    <div class="item-subpart">
-      <span> Open data widget (version bêta) </span>
-    </div>
+    <div class="item-subpart">Synchronisation de données ouvertes</div>
   </div>
 </template>
 
@@ -39,8 +33,8 @@
 .header {
   display: flex;
   flex-wrap: wrap;
-  margin-top: 10px;
-  margin-bottom: 10px;
+  align-items: center;
+  margin-bottom: 1.5rem;
   text-align: left;
   font-family: Marianne, Arial, Helvetica, sans-serif;
   font-size: 12px;
@@ -48,12 +42,11 @@
 }
 .item-header {
   margin-right: 20px;
-  line-height: 60px;
-  vertical-align: middle;
+  line-height: 0;
 }
 .item-subpart {
-  line-height: 50px;
-  font-size: 1rem;
+  font-size: 0.875rem;
+  color: var(--text-mention-grey, #666);
 }
 
 /* Hide item-subpart on small screens */

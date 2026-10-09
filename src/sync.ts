@@ -1,12 +1,12 @@
 // Synchronisation (upsert) d'une ressource data.gouv vers une table Grist.
-// Utilisé à l'import initial (ImporterForm) et pour les mises à jour en un clic (SyncList).
-import { processString } from '@/utils';
+
+export const TABULAR_API = import.meta.env.VUE_APP_DATAGOUV_TABULAR_API || 'https://tabular-api.data.gouv.fr';
 
 // Colonne horodatée par Grist (formule déclenchée NOW()) : mise à jour seulement quand une valeur de la ligne change réellement
 export const MAJ_COL = 'maj_datagouv';
 // Clé générée quand la source n'a pas d'identifiant : empreinte SHA-1 du contenu de la ligne
 export const HASH_COL = 'cle_datagouv';
-export const MAX_PAGES = 50; // même plafond que le mode remplacement (≈ 10 000 lignes)
+export const MAX_PAGES = 50; // ≈ 10 000 lignes
 const PAGE_SIZE = 200;
 const RECALC_MANUAL_UPDATES = 2; // RecalcWhen.MANUAL_UPDATES côté Grist
 const OPTION_KEY = 'syncs';
@@ -31,25 +31,39 @@ export interface SyncStats {
   truncated: boolean;
 }
 
-export function formatStats(st: SyncStats): string {
-  const parts = [`${st.added} ajoutée(s)`, `${st.updated} mise(s) à jour`, `${st.unchanged} inchangée(s)`];
-  if (st.removed !== null) parts.push(`${st.removed} supprimée(s)`);
-  let msg = `${st.rows} lignes lues dans la source : ${parts.join(', ')}.`;
-  if (st.truncated) msg += ` Import limité à ${MAX_PAGES} pages : suppression des lignes absentes non effectuée.`;
-  return msg;
-}
+export type Progress = (page: number, totalPages: number) => void;
 
-interface SyncContext {
-  docId: string;
-  gristUrl: string;
-  tabularapiUrl: string;
+const grist = () => window.grist;
+
+// Les objets réactifs de Vue (Proxy) ne passent pas le postMessage vers Grist : on envoie toujours une copie simple
+const plain = <T>(v: T): T => JSON.parse(JSON.stringify(v));
+
+// --- Identifiants Grist ---
+
+function toIdent(str: string): string {
+  return str
+    .normalize('NFD')
+    .replace(/\p{M}+/gu, '') // accents
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
 }
 
 // Grist préfixe par "c" les identifiants de colonne commençant par un chiffre
 export const toGristColId = (key: string) => {
-  const k = processString(key);
+  const k = toIdent(key);
   return /^\d/.test(k) ? 'c' + k : k;
 };
+
+export const toGristTableId = (name: string) => {
+  const k = toIdent(name) || 'Donnees';
+  return /^\d/.test(k) ? 'T' + k : k.charAt(0).toUpperCase() + k.slice(1);
+};
+
+export async function createTable(name: string): Promise<string> {
+  const r = await grist().docApi.applyUserActions([['AddTable', toGristTableId(name), []]]);
+  return r.retValues[0].table_id;
+}
+
 const toCell = (v: any) => (v === null || v === undefined ? null : String(v));
 
 async function rowHash(item: Record<string, any>, srcCols: string[]): Promise<string> {
@@ -58,105 +72,89 @@ async function rowHash(item: Record<string, any>, srcCols: string[]): Promise<st
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function getContext(): Promise<SyncContext> {
-  const docId = await window.grist.docApi.getDocName();
-  let gristUrl = import.meta.env.VUE_APP_GRIST_URL || '';
-  try {
-    const res = await window.grist.getAccessToken();
-    gristUrl = res.baseUrl.split('/o/')[0];
-  } catch {
-    /* on garde la valeur par défaut */
-  }
-  return { docId, gristUrl, tabularapiUrl: import.meta.env.VUE_APP_DATAGOUV_TABULAR_API ?? '' };
-}
-
-// --- Mémorisation des synchronisations dans les options du widget (stockées dans le document) ---
+// --- Synchronisations mémorisées dans les options du widget (stockées dans le document) ---
 
 export async function loadSyncs(): Promise<Record<string, SyncConfig>> {
   try {
-    return ((await window.grist.getOption(OPTION_KEY)) as Record<string, SyncConfig>) ?? {};
+    return ((await grist().getOption(OPTION_KEY)) as Record<string, SyncConfig>) ?? {};
   } catch {
     return {};
   }
 }
 
-// Les objets réactifs de Vue (Proxy) ne passent pas le postMessage vers Grist : on envoie toujours une copie simple
-const plain = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-
-export async function saveSync(cfg: SyncConfig): Promise<void> {
-  const all = await loadSyncs();
-  all[cfg.table] = plain(cfg);
-  await window.grist.setOption(OPTION_KEY, plain(all));
+async function saveAll(all: Record<string, SyncConfig>) {
+  await grist().setOption(OPTION_KEY, plain(all));
 }
 
 // Toute écriture dans les options fait apparaître le bouton « Enregistrer » de Grist :
-// on n'enregistre la config que si elle a réellement changé.
+// on n'écrit que si la configuration a réellement changé. Renvoie true si une écriture a eu lieu.
 export async function saveSyncIfChanged(cfg: SyncConfig): Promise<boolean> {
   const all = await loadSyncs();
   if (JSON.stringify(all[cfg.table]) === JSON.stringify(plain(cfg))) return false;
-  await saveSync(cfg);
+  all[cfg.table] = plain(cfg);
+  await saveAll(all);
   return true;
-}
-
-// Date du dernier passage : stockée dans le navigateur pour ne pas modifier le document à chaque mise à jour
-const lastRunKey = (docId: string, table: string) => `datagouv-sync:${docId}:${table}`;
-
-export async function getLastRun(table: string): Promise<string | null> {
-  try {
-    return localStorage.getItem(lastRunKey(await window.grist.docApi.getDocName(), table));
-  } catch {
-    return null;
-  }
 }
 
 export async function removeSync(table: string): Promise<void> {
   const all = await loadSyncs();
   delete all[table];
-  await window.grist.setOption(OPTION_KEY, plain(all));
+  await saveAll(all);
+}
+
+// Date du dernier passage : gardée dans le navigateur pour ne pas modifier le document à chaque mise à jour
+const lastRunKey = async (table: string) => `datagouv-sync:${await grist().docApi.getDocName()}:${table}`;
+
+export async function getLastRun(table: string): Promise<string | null> {
+  try {
+    return localStorage.getItem(await lastRunKey(table));
+  } catch {
+    return null;
+  }
+}
+
+async function setLastRun(table: string) {
+  try {
+    localStorage.setItem(await lastRunKey(table), new Date().toISOString());
+  } catch {
+    /* stockage navigateur indisponible : sans conséquence */
+  }
+}
+
+// --- Bilan ---
+
+export function formatStats(st: SyncStats): string {
+  const parts = [`${st.added} ajoutée(s)`, `${st.updated} mise(s) à jour`, `${st.unchanged} inchangée(s)`];
+  if (st.removed !== null) parts.push(`${st.removed} supprimée(s)`);
+  let msg = `${st.rows} lignes lues dans la source : ${parts.join(', ')}.`;
+  if (st.truncated) msg += ` Import limité à ${MAX_PAGES} pages : suppression des lignes absentes non effectuée.`;
+  return msg;
 }
 
 // --- Synchronisation ---
 
-async function getRawSectionParentId(ctx: SyncContext, table: string, token: string) {
-  const resp = await fetch(`${ctx.gristUrl}/api/docs/${ctx.docId}/tables/?auth=${token}`);
-  if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
-  const tables = await resp.json();
-  const t = tables.tables.find((tb: { id: string }) => tb.id === table);
-  return t ? t.fields.rawViewSectionRef - 1 : 1; // même logique que le mode remplacement
-}
-
-export async function runSync(
-  cfgIn: SyncConfig,
-  onProgress: (step: number) => void = () => {},
-): Promise<SyncStats> {
+export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}): Promise<SyncStats> {
   const cfg = plain(cfgIn);
-  const ctx = await getContext();
-  const docApi = window.grist.docApi;
+  const docApi = grist().docApi;
   const table = cfg.table;
   const hashMode = cfg.keyMode === 'hash';
   const keys = hashMode ? [HASH_COL] : [...cfg.keys];
   // En mode empreinte, une ligne modifiée devient une nouvelle ligne : l'ancienne doit disparaître
   const deleteMissing = hashMode || cfg.deleteMissing;
-  onProgress(2);
 
-  // 1. Colonnes : on conserve l'existant, on n'ajoute que ce qui manque
+  // 1. Colonnes techniques ; les colonnes existantes sont conservées
   const existingCols = new Set(Object.keys(await docApi.fetchTable(table)));
-  const tokenInfo = await docApi.getAccessToken({ readOnly: true });
-  const parentId = await getRawSectionParentId(ctx, table, tokenInfo.token);
-
   const addColumn = async (colId: string, colInfo: object): Promise<string> => {
-    const r = await docApi.applyUserActions([['AddColumn', table, colId, colInfo]]);
-    const ret = r.retValues[0];
-    await docApi.applyUserActions([
-      ['AddRecord', '_grist_Views_section_field', null, { parentPos: null, parentId, colRef: ret.colRef }],
-    ]);
-    existingCols.add(ret.colId);
-    return ret.colId;
+    // AddVisibleColumn : ajoute la colonne et l'affiche dans les vues de la table
+    const r = await docApi.applyUserActions([['AddVisibleColumn', table, colId, colInfo]]);
+    const newId: string = r.retValues[0].colId;
+    existingCols.add(newId);
+    return newId;
   };
 
   if (!existingCols.has(MAJ_COL)) {
-    // Formule déclenchée : NOW() recalculé à la création de la ligne et à chaque modification réelle d'une de ses cellules.
-    // Grist ignore les mises à jour sans changement de valeur, donc une ligne identique garde son horodatage.
+    // NOW() recalculé à la création de la ligne et à chaque modification réelle d'une de ses cellules.
+    // Grist ignore les mises à jour sans changement de valeur : une ligne identique garde son horodatage.
     await addColumn(MAJ_COL, {
       type: 'DateTime:Europe/Paris',
       isFormula: false,
@@ -167,7 +165,6 @@ export async function runSync(
   if (hashMode && !existingCols.has(HASH_COL)) {
     await addColumn(HASH_COL, { type: 'Text', isFormula: false });
   }
-  onProgress(3);
 
   // État avant import : sert à compter ajouts (nouvel id) et mises à jour (date maj_datagouv changée)
   const before = await docApi.fetchTable(table);
@@ -181,12 +178,12 @@ export async function runSync(
 
   for (let page = 1; page <= Math.min(totalPages, MAX_PAGES); page++) {
     const resp = await fetch(
-      `${ctx.tabularapiUrl}/api/resources/${cfg.resourceId}/data/?page_size=${PAGE_SIZE}&page=${page}`,
+      `${TABULAR_API}/api/resources/${cfg.resourceId}/data/?page_size=${PAGE_SIZE}&page=${page}`,
     );
-    if (!resp.ok) throw new Error(`Erreur API tabulaire (${resp.status}).`);
+    if (!resp.ok) throw new Error(`Erreur de l'API tabulaire data.gouv (${resp.status}).`);
     const result = await resp.json();
     totalPages = Math.max(1, Math.ceil((result.meta?.total ?? 0) / PAGE_SIZE));
-    onProgress(Math.min(8, 3 + Math.floor((page * 5) / Math.min(totalPages, MAX_PAGES))));
+    onProgress(page, Math.min(totalPages, MAX_PAGES));
     const data: any[] = result.data ?? [];
     if (data.length === 0) break;
 
@@ -195,14 +192,15 @@ export async function runSync(
         if (src === '__id' || src in colIdOf) continue;
         const colId = toGristColId(src);
         if (colId === 'id') continue;
+        // Colonne vide (comme le widget d'origine) : Grist la transforme en colonne de données au premier remplissage
         colIdOf[src] = existingCols.has(colId)
           ? colId
           : await addColumn(colId, { isFormula: true, type: 'Any', formula: '' });
       }
     }
     if (!hashMode) {
-      const missingKeys = keys.filter((k) => !Object.values(colIdOf).includes(k));
-      if (missingKeys.length) throw new Error(`Colonne(s) clé introuvable(s) : ${missingKeys.join(', ')}`);
+      const missing = keys.filter((k) => !Object.values(colIdOf).includes(k));
+      if (missing.length) throw new Error(`Colonne(s) clé introuvable(s) dans la source : ${missing.join(', ')}`);
     }
 
     const srcCols = Object.keys(colIdOf).sort();
@@ -212,11 +210,8 @@ export async function runSync(
       if (hashMode) require[HASH_COL].push(await rowHash(item, srcCols));
       for (const [src, colId] of Object.entries(colIdOf)) {
         const v = toCell(item[src]);
-        if (keys.includes(colId)) {
-          require[colId].push(v);
-        } else {
-          (values[colId] ??= []).push(v);
-        }
+        if (keys.includes(colId)) require[colId].push(v);
+        else (values[colId] ??= []).push(v);
       }
       seen.add(JSON.stringify(keys.map((k) => require[k][require[k].length - 1])));
     }
@@ -225,11 +220,11 @@ export async function runSync(
     rows += data.length;
   }
 
-  // 3. Suppression des lignes disparues de la source (seulement si on a tout lu)
+  // 3. Suppression des lignes disparues de la source (seulement si tout a été lu) et bilan
   const truncated = totalPages > MAX_PAGES;
-  let removed: number | null = null;
   const current = await docApi.fetchTable(table);
   const removedIds = new Set<number>();
+  let removed: number | null = null;
   if (deleteMissing && !truncated) {
     (current.id as number[]).forEach((rid, i) => {
       if (!seen.has(JSON.stringify(keys.map((k) => current[k][i])))) removedIds.add(rid);
@@ -248,10 +243,6 @@ export async function runSync(
     else unchanged++;
   });
 
-  try {
-    localStorage.setItem(lastRunKey(ctx.docId, table), new Date().toISOString());
-  } catch {
-    /* stockage navigateur indisponible : sans conséquence */
-  }
+  await setLastRun(table);
   return { rows, added, updated, unchanged, removed, truncated };
 }
