@@ -2,9 +2,27 @@
 
     <div v-if="currentStep === 'selectTable'">
     <!-- 1/ cette page est celle qui est affichée pour choisir quelle table Grist utiliser -->
+        <fieldset class="fr-fieldset">
+            <legend class="fr-fieldset__legend--regular fr-fieldset__legend">Mode d'import</legend>
+            <div class="fr-fieldset__element">
+                <div class="fr-radio-group">
+                    <input type="radio" id="mode-replace" value="replace" v-model="importMode">
+                    <label class="fr-label" for="mode-replace">Remplacer tout le contenu de la table</label>
+                </div>
+            </div>
+            <div class="fr-fieldset__element">
+                <div class="fr-radio-group">
+                    <input type="radio" id="mode-upsert" value="upsert" v-model="importMode">
+                    <label class="fr-label" for="mode-upsert">
+                        Mettre à jour (upsert)
+                        <span class="fr-hint-text">Les lignes sont rapprochées par une clé ; la colonne {{ MAJ_COL }} indique la date de dernière modification.</span>
+                    </label>
+                </div>
+            </div>
+        </fieldset>
         <legend class="fr-fieldset__legend--regular fr-fieldset__legend" id="radio-hint-legend">
             Sélectionnez la table que vous voulez utiliser.
-            <span class="fr-hint-text">Attention, toute donnée de cette table sera supprimée</span>
+            <span v-if="importMode === 'replace'" class="fr-hint-text">Attention, toute donnée de cette table sera supprimée</span>
         </legend>
         <div v-for="item in activeGristTables" v-bind:key="item">
             <div class="fr-fieldset__element">
@@ -83,6 +101,27 @@
         </div>
     </div>
 
+    <div v-if="currentStep === 'selectKey'">
+    <!-- 3bis/ mode upsert : choix de la ou des colonnes servant de clé de rapprochement -->
+        <fieldset class="fr-fieldset">
+            <legend class="fr-fieldset__legend--regular fr-fieldset__legend">
+                Colonne(s) identifiant de manière unique une ligne
+                <span class="fr-hint-text">Ex. : SIRET, code INSEE, identifiant d'établissement. Plusieurs colonnes = clé composite.</span>
+            </legend>
+            <div v-for="col in availableColumns" :key="col" class="fr-fieldset__element">
+                <div class="fr-checkbox-group">
+                    <input type="checkbox" :id="'key-' + col" :value="col" v-model="keyColumns">
+                    <label class="fr-label" :for="'key-' + col">{{ col }}</label>
+                </div>
+            </div>
+        </fieldset>
+        <div class="fr-checkbox-group fr-mb-2w">
+            <input type="checkbox" id="delete-missing" v-model="deleteMissing">
+            <label class="fr-label" for="delete-missing">Supprimer les lignes de la table absentes de la source</label>
+        </div>
+        <button class="fr-btn" :disabled="keyColumns.length === 0" @click="confirmUpsert">Lancer la mise à jour</button>
+    </div>
+
     <div>
     <!-- 4/ cette page est celle qui est affichée quand l'import est en cours -->
         <div v-if="currentStep === 'loading'" class="fr-stepper">
@@ -97,6 +136,10 @@
     <!-- 5/ cette page est celle qui est affichée quand l'import est terminé -->
         <br />
         🎉 Données importées dans la table {{ selectedTable }}
+        <p v-if="upsertStats" class="fr-text--sm fr-mt-1w">
+            {{ upsertStats.rows }} lignes source traitées<span v-if="upsertStats.removed !== null">, {{ upsertStats.removed }} lignes supprimées</span>.
+            <span v-if="upsertStats.truncated"> Import limité à {{ MAX_PAGES }} pages : suppression des lignes absentes non effectuée.</span>
+        </p>
     </div>
 
 
@@ -116,6 +159,19 @@ interface Resource {
   resource_title: any;
   organization_name?: any;
 }
+
+// Colonne horodatée par Grist (formule déclenchée NOW()) : mise à jour seulement quand une valeur de la ligne change réellement
+const MAJ_COL = "maj_datagouv";
+const MAX_PAGES = 50;      // même plafond que le mode remplacement (≈ 10 000 lignes)
+const PAGE_SIZE = 200;
+const RECALC_MANUAL_UPDATES = 2; // RecalcWhen.MANUAL_UPDATES côté Grist
+
+// Grist préfixe par "c" les identifiants de colonne commençant par un chiffre
+const toGristColId = (key: string) => {
+  const k = processString(key);
+  return /^\d/.test(k) ? "c" + k : k;
+};
+const toCell = (v: any) => (v === null || v === undefined ? null : String(v));
 
 function debounce<T extends () => void>(fn: T, delay: number): () => void {
   let timeoutID: number;
@@ -143,6 +199,12 @@ export default defineComponent({
     const nbPages = ref(0)
     const showLoader = ref(false)
     const isImported = ref(false)
+    const importMode = ref<"replace" | "upsert">("replace")
+    const pendingResourceId = ref<string | null>(null)
+    const availableColumns = ref<string[]>([])
+    const keyColumns = ref<string[]>([])
+    const deleteMissing = ref(false)
+    const upsertStats = ref<{ rows: number; removed: number | null; truncated: boolean } | null>(null)
     const datagouvUrl = import.meta.env.VUE_APP_DATAGOUV_IMPORT_URL
     const tabularapiUrl = import.meta.env.VUE_APP_DATAGOUV_TABULAR_API
     let gristUrl = ""
@@ -318,6 +380,18 @@ export default defineComponent({
                     : `Erreur lors de l'accès à l'API tabulaire (${probe.status}).`;
                 return;
             }
+            if (importMode.value === "upsert") {
+                // On s'arrête ici pour faire choisir la clé ; l'import reprend dans confirmUpsert()
+                const sample = await probe.json();
+                availableColumns.value = Object.keys(sample.data?.[0] ?? {})
+                    .filter((k) => k !== "__id")
+                    .map(toGristColId)
+                    .filter((k) => k !== "id");
+                keyColumns.value = [];
+                pendingResourceId.value = id;
+                showLoader.value = false;
+                return;
+            }
         } catch (e: any) {
             showLoader.value = false;
             isImported.value = false;
@@ -440,6 +514,126 @@ export default defineComponent({
         isImported.value = true
     };
 
+    const getRawSectionParentId = async (token: string) => {
+        const resp = await fetch(gristUrl + "/api/docs/" + store.state.docId + "/tables/?auth=" + token);
+        if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
+        const tables = await resp.json();
+        const t = tables.tables.find((tb: { id: string }) => tb.id === selectedTable.value);
+        return t ? t.fields.rawViewSectionRef - 1 : 1; // même logique que le mode remplacement
+    };
+
+    const runUpsert = async (id: string) => {
+        const docApi = window.grist.docApi;
+        const table = selectedTable.value;
+        const keys = [...keyColumns.value];
+        urlError.value = "";
+        upsertStats.value = null;
+        showLoader.value = true;
+        ongoingStep.value = 2;
+
+        try {
+            // 1. Colonnes : on conserve l'existant, on n'ajoute que ce qui manque
+            const existingCols = new Set(Object.keys(await docApi.fetchTable(table)));
+            const tokenInfo = await docApi.getAccessToken({ readOnly: true });
+            const parentId = await getRawSectionParentId(tokenInfo.token);
+
+            const addColumn = async (colId: string, colInfo: object): Promise<string> => {
+                const r = await docApi.applyUserActions([["AddColumn", table, colId, colInfo]]);
+                const ret = r.retValues[0];
+                await docApi.applyUserActions([["AddRecord", "_grist_Views_section_field", null, { parentPos: null, parentId, colRef: ret.colRef }]]);
+                existingCols.add(ret.colId);
+                return ret.colId;
+            };
+
+            if (!existingCols.has(MAJ_COL)) {
+                // Formule déclenchée : NOW() recalculé à la création de la ligne et à chaque modification réelle d'une de ses cellules.
+                // Grist ignore les mises à jour sans changement de valeur, donc une ligne identique garde son horodatage.
+                await addColumn(MAJ_COL, {
+                    type: "DateTime:Europe/Paris",
+                    isFormula: false,
+                    formula: "NOW()",
+                    recalcWhen: RECALC_MANUAL_UPDATES,
+                });
+            }
+            ongoingStep.value = 3;
+
+            // 2. Pages de l'API tabulaire → BulkAddOrUpdateRecord
+            const colIdOf: Record<string, string> = {}; // nom source -> id de colonne Grist
+            const seen = new Set<string>();
+            let rows = 0;
+            let totalPages = 1;
+
+            for (let page = 1; page <= Math.min(totalPages, MAX_PAGES); page++) {
+                const resp = await fetch(`${tabularapiUrl}/api/resources/${id}/data/?page_size=${PAGE_SIZE}&page=${page}`);
+                if (!resp.ok) throw new Error(`Erreur API tabulaire (${resp.status}).`);
+                const result = await resp.json();
+                totalPages = Math.max(1, Math.ceil((result.meta?.total ?? 0) / PAGE_SIZE));
+                ongoingStep.value = Math.min(8, 3 + Math.floor((page * 5) / Math.min(totalPages, MAX_PAGES)));
+                const data: any[] = result.data ?? [];
+                if (data.length === 0) break;
+
+                for (const item of data) {
+                    for (const src of Object.keys(item)) {
+                        if (src === "__id" || src in colIdOf) continue;
+                        const colId = toGristColId(src);
+                        if (colId === "id") continue;
+                        colIdOf[src] = existingCols.has(colId)
+                            ? colId
+                            : await addColumn(colId, { isFormula: true, type: "Any", formula: "" });
+                    }
+                }
+                const missingKeys = keys.filter((k) => !Object.values(colIdOf).includes(k));
+                if (missingKeys.length) throw new Error(`Colonne(s) clé introuvable(s) : ${missingKeys.join(", ")}`);
+
+                const require: Record<string, any[]> = Object.fromEntries(keys.map((k) => [k, []]));
+                const values: Record<string, any[]> = {};
+                for (const item of data) {
+                    const rowKey: any[] = [];
+                    for (const [src, colId] of Object.entries(colIdOf)) {
+                        const v = toCell(item[src]);
+                        if (keys.includes(colId)) {
+                            require[colId].push(v);
+                        } else {
+                            (values[colId] ??= []).push(v);
+                        }
+                    }
+                    for (const k of keys) rowKey.push(require[k][require[k].length - 1]);
+                    seen.add(JSON.stringify(rowKey));
+                }
+
+                await docApi.applyUserActions([["BulkAddOrUpdateRecord", table, require, values, { on_many: "first" }]]);
+                rows += data.length;
+            }
+
+            // 3. Optionnel : suppression des lignes disparues de la source (seulement si on a tout lu)
+            const truncated = totalPages > MAX_PAGES;
+            let removed: number | null = null;
+            if (deleteMissing.value && !truncated) {
+                const current = await docApi.fetchTable(table);
+                const toRemove = (current.id as number[]).filter(
+                    (_, i) => !seen.has(JSON.stringify(keys.map((k) => current[k][i])))
+                );
+                if (toRemove.length) await docApi.applyUserActions([["BulkRemoveRecord", table, toRemove]]);
+                removed = toRemove.length;
+            }
+
+            upsertStats.value = { rows, removed, truncated };
+            isImported.value = true;
+        } catch (e: any) {
+            console.error(e);
+            urlError.value = e?.message || "Erreur lors de la mise à jour (BulkAddOrUpdateRecord).";
+        } finally {
+            showLoader.value = false;
+        }
+    };
+
+    const confirmUpsert = async () => {
+        const id = pendingResourceId.value;
+        if (!id) return;
+        pendingResourceId.value = null;
+        await runUpsert(id);
+    };
+
     const getActiveGristTables = async () => {
       const activeGristTables = await window.grist.docApi.listTables();
       store.dispatch('updateActiveGristTables', activeGristTables);
@@ -457,6 +651,7 @@ export default defineComponent({
       // In reverted order so that later steps have precedence
       if (isImported.value) return "imported";
       if (showLoader.value) return "loading";
+      if (pendingResourceId.value) return "selectKey";
       if (showDatasetSelector.value) return "searchDataset";
       if (selectedTable.value !== "") {
         const hasOrganizations = profile.value?.organizations?.length > 0;
@@ -487,6 +682,14 @@ export default defineComponent({
         nbPages,
         showLoader,
         isImported,
+        importMode,
+        availableColumns,
+        keyColumns,
+        deleteMissing,
+        confirmUpsert,
+        upsertStats,
+        MAJ_COL,
+        MAX_PAGES,
     }
 
   }
