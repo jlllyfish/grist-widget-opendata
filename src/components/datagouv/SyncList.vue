@@ -37,7 +37,7 @@
 
 <script lang="ts">
 import { defineComponent, onMounted, ref } from 'vue';
-import { getLastRun, loadSyncs, removeSync, runSync, type SyncConfig } from './sync';
+import { formatStats, getLastRun, loadSyncs, removeSync, runSync, type SyncConfig } from './sync';
 
 export default defineComponent({
   name: 'SyncList',
@@ -67,11 +67,7 @@ export default defineComponent({
         const st = await runSync(cfg, (step) => {
           status.value[cfg.table] = `Mise à jour en cours… (${step}/8)`;
         });
-        status.value[cfg.table] =
-          `✅ ${st.rows} lignes source traitées` +
-          (st.removed !== null ? `, ${st.removed} supprimées` : '') +
-          (st.truncated ? ' (import limité, suppressions non effectuées)' : '') +
-          '.';
+        status.value[cfg.table] = '✅ ' + formatStats(st);
         await reload();
       } catch (e: any) {
         console.error(e);

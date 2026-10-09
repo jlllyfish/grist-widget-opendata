@@ -23,9 +23,20 @@ export interface SyncConfig {
 }
 
 export interface SyncStats {
-  rows: number;
-  removed: number | null;
+  rows: number; // lignes lues dans la source
+  added: number;
+  updated: number;
+  unchanged: number;
+  removed: number | null; // null : suppression non demandée ou impossible (import tronqué)
   truncated: boolean;
+}
+
+export function formatStats(st: SyncStats): string {
+  const parts = [`${st.added} ajoutée(s)`, `${st.updated} mise(s) à jour`, `${st.unchanged} inchangée(s)`];
+  if (st.removed !== null) parts.push(`${st.removed} supprimée(s)`);
+  let msg = `${st.rows} lignes lues dans la source : ${parts.join(', ')}.`;
+  if (st.truncated) msg += ` Import limité à ${MAX_PAGES} pages : suppression des lignes absentes non effectuée.`;
+  return msg;
 }
 
 interface SyncContext {
@@ -158,6 +169,10 @@ export async function runSync(
   }
   onProgress(3);
 
+  // État avant import : sert à compter ajouts (nouvel id) et mises à jour (date maj_datagouv changée)
+  const before = await docApi.fetchTable(table);
+  const majBefore = new Map<number, unknown>((before.id as number[]).map((rid, i) => [rid, before[MAJ_COL]?.[i]]));
+
   // 2. Pages de l'API tabulaire → BulkAddOrUpdateRecord
   const colIdOf: Record<string, string> = {}; // nom source -> id de colonne Grist
   const seen = new Set<string>();
@@ -213,19 +228,30 @@ export async function runSync(
   // 3. Suppression des lignes disparues de la source (seulement si on a tout lu)
   const truncated = totalPages > MAX_PAGES;
   let removed: number | null = null;
+  const current = await docApi.fetchTable(table);
+  const removedIds = new Set<number>();
   if (deleteMissing && !truncated) {
-    const current = await docApi.fetchTable(table);
-    const toRemove = (current.id as number[]).filter(
-      (_, i) => !seen.has(JSON.stringify(keys.map((k) => current[k][i]))),
-    );
-    if (toRemove.length) await docApi.applyUserActions([['BulkRemoveRecord', table, toRemove]]);
-    removed = toRemove.length;
+    (current.id as number[]).forEach((rid, i) => {
+      if (!seen.has(JSON.stringify(keys.map((k) => current[k][i])))) removedIds.add(rid);
+    });
+    if (removedIds.size) await docApi.applyUserActions([['BulkRemoveRecord', table, [...removedIds]]]);
+    removed = removedIds.size;
   }
+
+  let added = 0;
+  let updated = 0;
+  let unchanged = 0;
+  (current.id as number[]).forEach((rid, i) => {
+    if (removedIds.has(rid)) return;
+    if (!majBefore.has(rid)) added++;
+    else if (JSON.stringify(majBefore.get(rid)) !== JSON.stringify(current[MAJ_COL][i])) updated++;
+    else unchanged++;
+  });
 
   try {
     localStorage.setItem(lastRunKey(ctx.docId, table), new Date().toISOString());
   } catch {
     /* stockage navigateur indisponible : sans conséquence */
   }
-  return { rows, removed, truncated };
+  return { rows, added, updated, unchanged, removed, truncated };
 }

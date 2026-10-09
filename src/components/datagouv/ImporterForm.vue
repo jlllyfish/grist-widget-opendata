@@ -155,8 +155,7 @@
         <br />
         🎉 Données importées dans la table {{ selectedTable }}
         <p v-if="upsertStats" class="fr-text--sm fr-mt-1w">
-            {{ upsertStats.rows }} lignes source traitées<span v-if="upsertStats.removed !== null">, {{ upsertStats.removed }} lignes supprimées</span>.
-            <span v-if="upsertStats.truncated"> Import limité à {{ MAX_PAGES }} pages : suppression des lignes absentes non effectuée.</span>
+            {{ formatStats(upsertStats) }}
         </p>
         <div v-if="configSaved" class="fr-alert fr-alert--info fr-alert--sm fr-mt-2w">
             <p>Pour mémoriser cette synchronisation, cliquez sur <strong>Enregistrer</strong> en haut du widget (une seule fois). Ensuite, le bouton « Mettre à jour » de l'accueil suffit.</p>
@@ -172,7 +171,7 @@
 import { defineComponent, computed, onMounted, ref } from 'vue';
 import { useStore } from 'vuex';
 import { processString } from '@/utils';
-import { MAJ_COL, HASH_COL, MAX_PAGES, toGristColId, runSync, saveSyncIfChanged, type KeyMode, type SyncConfig, type SyncStats } from './sync';
+import { MAJ_COL, HASH_COL, MAX_PAGES, toGristColId, runSync, saveSyncIfChanged, formatStats, type KeyMode, type SyncConfig, type SyncStats } from './sync';
 
 
 interface Resource {
@@ -617,6 +616,7 @@ export default defineComponent({
         deleteMissing,
         confirmUpsert,
         upsertStats,
+        formatStats,
         configSaved,
         goHome,
         MAJ_COL,
