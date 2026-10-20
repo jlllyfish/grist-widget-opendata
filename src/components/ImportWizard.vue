@@ -167,12 +167,10 @@
         <h3 class="fr-alert__title">Données importées dans la table {{ finalTable }}</h3>
         <p>{{ formatStats(stats) }}</p>
       </div>
-      <div v-if="configSaved" class="fr-alert fr-alert--info fr-alert--sm fr-mb-3w">
-        <p>
-          Pour mémoriser cette synchronisation, cliquez sur <strong>Enregistrer</strong> en haut du widget (une seule
-          fois). Ensuite, le bouton « Mettre à jour » de l'accueil suffit.
-        </p>
-      </div>
+      <p class="fr-text--sm">
+        Cette synchronisation est mémorisée dans le document (table {{ STORE_TABLE }}) : vous la retrouverez sur l'accueil
+        du widget pour la mettre à jour en un clic.
+      </p>
       <button class="fr-btn fr-btn--icon-left fr-icon-arrow-left-line" @click="emit('home')">Retour à l'accueil</button>
     </section>
   </div>
@@ -187,7 +185,8 @@ import {
   formatStats,
   loadSyncs,
   runSync,
-  saveSyncIfChanged,
+  saveSync,
+  STORE_TABLE,
   toGristTableId,
   type KeyMode,
   type SyncConfig,
@@ -308,7 +307,6 @@ const deleteMissing = ref(false);
 // --- Import ---
 const progress = ref({ page: 0, total: 1 });
 const stats = ref<SyncStats | null>(null);
-const configSaved = ref(false);
 const finalTable = ref('');
 let createdTable = ''; // évite de recréer la table si on relance après une erreur
 watch(newTableName, () => (createdTable = ''));
@@ -333,7 +331,7 @@ async function start() {
       deleteMissing: deleteMissing.value,
     };
     stats.value = await runSync(cfg, (page, total) => (progress.value = { page, total }));
-    configSaved.value = await saveSyncIfChanged(cfg);
+    await saveSync(cfg, stats.value);
     step.value = 'done';
   } catch (e: any) {
     console.error(e);

@@ -15,8 +15,10 @@ Dérivé de [datagouv/grist-plugin-opendata](https://github.com/datagouv/grist-p
     remplacée et les lignes disparues sont supprimées.
 - **Horodatage** : la colonne `maj_datagouv` (formule déclenchée `NOW()`) indique la date de création ou de dernière
   modification de chaque ligne.
-- Les synchronisations sont mémorisées dans les options du widget (bouton « Enregistrer » de Grist, une fois) et
-  listées sur l'accueil avec un bouton « Mettre à jour ».
+- Les synchronisations sont mémorisées dans le document, dans la table technique `Synchro_datagouv` (visible dans
+  « Données brutes », sans page). Elles sont listées sur l'accueil avec un bouton « Mettre à jour », et un badge signale
+  quand data.gouv.fr a publié une version plus récente que la dernière mise à jour.
+  Supprimer une ligne de `Synchro_datagouv` revient à « oublier » la synchronisation.
 
 Limite : 50 pages de 200 lignes (10 000 lignes) par ressource.
 
@@ -41,7 +43,7 @@ Le workflow `.github/workflows/pages.yml` publie le widget sur GitHub Pages à c
 
 ## Code
 
-- `src/sync.ts` : moteur de synchronisation (colonnes, `BulkAddOrUpdateRecord`, suppressions, bilan, mémorisation).
+- `src/sync.ts` : moteur de synchronisation (colonnes, `BulkAddOrUpdateRecord`, suppressions, bilan) et mémorisation dans `Synchro_datagouv`.
 - `src/datagouv.ts` : recherche et résolution d'URL sur l'API data.gouv.fr.
 - `src/components/HomeView.vue` : accueil et mises à jour.
 - `src/components/ImportWizard.vue` : assistant d'import en 3 étapes.

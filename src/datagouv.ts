@@ -75,3 +75,13 @@ export async function sourceColumns(resourceId: string): Promise<string[]> {
     .map(toGristColId)
     .filter((k) => k !== 'id');
 }
+
+// Date de dernière modification de la ressource sur data.gouv.fr (null si inconnue)
+export async function resourceLastModified(resourceId: string): Promise<string | null> {
+  try {
+    const info = await getJson(`${DATAGOUV_URL}/api/2/datasets/resources/${resourceId}/`);
+    return info.resource?.last_modified ?? null;
+  } catch {
+    return null;
+  }
+}

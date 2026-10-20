@@ -9,7 +9,10 @@ export const HASH_COL = 'cle_datagouv';
 export const MAX_PAGES = 50; // ≈ 10 000 lignes
 const PAGE_SIZE = 200;
 const RECALC_MANUAL_UPDATES = 2; // RecalcWhen.MANUAL_UPDATES côté Grist
-const OPTION_KEY = 'syncs';
+const OPTION_KEY = 'syncs'; // ancien stockage (options du widget), relu une fois pour migration
+// Table technique (sans page) où sont mémorisées les synchronisations : ce sont des données du document,
+// enregistrées immédiatement, contrairement aux options du widget qui exigent un clic sur « Enregistrer ».
+export const STORE_TABLE = 'Synchro_datagouv';
 
 export type KeyMode = 'columns' | 'hash';
 
@@ -20,6 +23,12 @@ export interface SyncConfig {
   keyMode: KeyMode;
   keys: string[]; // colonnes Grist servant de clé (mode 'columns')
   deleteMissing: boolean;
+}
+
+export interface SavedSync extends SyncConfig {
+  rowId: number;
+  lastRun: string | null; // ISO
+  lastReport: string;
 }
 
 export interface SyncStats {
@@ -72,53 +81,100 @@ async function rowHash(item: Record<string, any>, srcCols: string[]): Promise<st
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// --- Synchronisations mémorisées dans les options du widget (stockées dans le document) ---
+// --- Synchronisations mémorisées dans la table Synchro_datagouv ---
 
-export async function loadSyncs(): Promise<Record<string, SyncConfig>> {
+const STORE_COLUMNS: [string, object][] = [
+  ['Table', { type: 'Text' }],
+  ['Ressource', { type: 'Text' }],
+  ['Titre', { type: 'Text' }],
+  ['Mode_cle', { type: 'Text' }],
+  ['Cles', { type: 'Text' }], // liste JSON
+  ['Supprimer_absentes', { type: 'Bool' }],
+  ['Derniere_maj', { type: 'DateTime:Europe/Paris' }],
+  ['Bilan', { type: 'Text' }],
+];
+
+async function ensureStoreTable(): Promise<void> {
+  const tables: string[] = await grist().docApi.listTables();
+  if (tables.includes(STORE_TABLE)) return;
+  // AddRawTable : table visible dans « Données brutes » uniquement, sans page ; on remplace ses colonnes A, B, C
+  await grist().docApi.applyUserActions([
+    ['AddRawTable', STORE_TABLE],
+    ['RemoveColumn', STORE_TABLE, 'A'],
+    ['RemoveColumn', STORE_TABLE, 'B'],
+    ['RemoveColumn', STORE_TABLE, 'C'],
+    ...STORE_COLUMNS.map(([id, info]) => ['AddColumn', STORE_TABLE, id, { isFormula: false, ...info }]),
+  ]);
+}
+
+function parseKeys(v: unknown): string[] {
   try {
-    return ((await grist().getOption(OPTION_KEY)) as Record<string, SyncConfig>) ?? {};
+    const k = JSON.parse(String(v ?? '[]'));
+    return Array.isArray(k) ? k.map(String) : [];
   } catch {
-    return {};
+    return [];
   }
 }
 
-async function saveAll(all: Record<string, SyncConfig>) {
-  await grist().setOption(OPTION_KEY, plain(all));
+async function readStore(): Promise<Record<string, SavedSync>> {
+  const tables: string[] = await grist().docApi.listTables();
+  if (!tables.includes(STORE_TABLE)) return {};
+  const t = await grist().docApi.fetchTable(STORE_TABLE);
+  const out: Record<string, SavedSync> = {};
+  (t.id as number[]).forEach((rowId, i) => {
+    const table = t.Table?.[i];
+    if (!table || !t.Ressource?.[i]) return;
+    const ts = t.Derniere_maj?.[i];
+    out[table] = {
+      rowId,
+      table,
+      resourceId: t.Ressource[i],
+      resourceTitle: t.Titre?.[i] || undefined,
+      keyMode: t.Mode_cle?.[i] === 'hash' ? 'hash' : 'columns',
+      keys: parseKeys(t.Cles?.[i]),
+      deleteMissing: Boolean(t.Supprimer_absentes?.[i]),
+      lastRun: typeof ts === 'number' ? new Date(ts * 1000).toISOString() : null,
+      lastReport: t.Bilan?.[i] || '',
+    };
+  });
+  return out;
 }
 
-// Toute écriture dans les options fait apparaître le bouton « Enregistrer » de Grist :
-// on n'écrit que si la configuration a réellement changé. Renvoie true si une écriture a eu lieu.
-export async function saveSyncIfChanged(cfg: SyncConfig): Promise<boolean> {
-  const all = await loadSyncs();
-  if (JSON.stringify(all[cfg.table]) === JSON.stringify(plain(cfg))) return false;
-  all[cfg.table] = plain(cfg);
-  await saveAll(all);
-  return true;
-}
-
-export async function removeSync(table: string): Promise<void> {
-  const all = await loadSyncs();
-  delete all[table];
-  await saveAll(all);
-}
-
-// Date du dernier passage : gardée dans le navigateur pour ne pas modifier le document à chaque mise à jour
-const lastRunKey = async (table: string) => `datagouv-sync:${await grist().docApi.getDocName()}:${table}`;
-
-export async function getLastRun(table: string): Promise<string | null> {
-  try {
-    return localStorage.getItem(await lastRunKey(table));
-  } catch {
-    return null;
+// Enregistre (ou met à jour) une synchronisation, avec le résultat de son dernier passage
+export async function saveSync(cfg: SyncConfig, stats?: SyncStats): Promise<void> {
+  await ensureStoreTable();
+  const values: Record<string, any[]> = {
+    Ressource: [cfg.resourceId],
+    Titre: [cfg.resourceTitle ?? ''],
+    Mode_cle: [cfg.keyMode],
+    Cles: [JSON.stringify(cfg.keys)],
+    Supprimer_absentes: [cfg.deleteMissing],
+  };
+  if (stats) {
+    values.Derniere_maj = [Date.now() / 1000];
+    values.Bilan = [formatStats(stats)];
   }
+  await grist().docApi.applyUserActions([
+    ['BulkAddOrUpdateRecord', STORE_TABLE, { Table: [cfg.table] }, values, { on_many: 'first' }],
+  ]);
 }
 
-async function setLastRun(table: string) {
-  try {
-    localStorage.setItem(await lastRunKey(table), new Date().toISOString());
-  } catch {
-    /* stockage navigateur indisponible : sans conséquence */
+export async function loadSyncs(): Promise<Record<string, SavedSync>> {
+  const tables: string[] = await grist().docApi.listTables();
+  if (!tables.includes(STORE_TABLE)) {
+    // Migration (une seule fois) : synchronisations enregistrées par une version précédente dans les options du widget
+    try {
+      const legacy = ((await grist().getOption(OPTION_KEY)) as Record<string, SyncConfig> | null) ?? {};
+      for (const c of Object.values(legacy)) if (c?.table && c.resourceId) await saveSync(plain(c));
+    } catch {
+      /* pas d'options : rien à migrer */
+    }
   }
+  return readStore();
+}
+
+export async function removeSync(rowId: number): Promise<void> {
+  await grist().docApi.applyUserActions([['RemoveRecord', STORE_TABLE, rowId]]);
 }
 
 // --- Bilan ---
@@ -243,6 +299,5 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
     else unchanged++;
   });
 
-  await setLastRun(table);
   return { rows, added, updated, unchanged, removed, truncated };
 }
