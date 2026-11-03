@@ -6,8 +6,9 @@ export const TABULAR_API = import.meta.env.VUE_APP_DATAGOUV_TABULAR_API || 'http
 export const MAJ_COL = 'maj_datagouv';
 // Clé générée quand la source n'a pas d'identifiant : empreinte SHA-1 du contenu de la ligne
 export const HASH_COL = 'cle_datagouv';
-export const MAX_PAGES = 50; // ≈ 10 000 lignes
-const PAGE_SIZE = 200;
+export const MAX_ROWS = 50_000; // lignes lues au maximum par ressource
+const PAGE_SIZE = 200; // lignes par requête à l'API tabulaire
+const WRITE_BATCH = 500; // lignes par écriture dans Grist
 const RECALC_MANUAL_UPDATES = 2; // RecalcWhen.MANUAL_UPDATES côté Grist
 const OPTION_KEY = 'syncs'; // ancien stockage (options du widget), relu une fois pour migration
 // Table technique (sans page) où sont mémorisées les synchronisations : ce sont des données du document,
@@ -32,6 +33,7 @@ export interface SavedSync extends SyncConfig {
 }
 
 export interface SyncStats {
+  total: number; // lignes de la ressource sur data.gouv.fr
   rows: number; // lignes lues dans la source
   added: number;
   updated: number;
@@ -40,7 +42,7 @@ export interface SyncStats {
   truncated: boolean;
 }
 
-export type Progress = (page: number, totalPages: number) => void;
+export type Progress = (phase: 'lecture' | 'écriture', done: number, total: number) => void;
 
 const grist = () => window.grist;
 
@@ -74,10 +76,33 @@ export async function createTable(name: string): Promise<string> {
 }
 
 const toCell = (v: any) => (v === null || v === undefined ? null : String(v));
+const toText = (v: any) => (v === null || v === undefined ? null : typeof v === 'object' ? JSON.stringify(v) : String(v));
 
-async function rowHash(item: Record<string, any>, srcCols: string[]): Promise<string> {
-  const payload = JSON.stringify(srcCols.map((k) => toCell(item[k])));
-  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(payload));
+// Valeur adaptée au type de la colonne Grist de destination
+function coerce(v: any, type: string): any {
+  if (v === null || v === undefined || v === '') return v ?? null;
+  if (type === 'Int' || type === 'Numeric') {
+    if (typeof v === 'number') return v;
+    const n = Number(String(v).trim());
+    return Number.isFinite(n) ? n : String(v);
+  }
+  if (type === 'Bool') {
+    if (typeof v === 'boolean') return v;
+    const t = String(v).trim().toLowerCase();
+    return ['true', '1', 'oui', 'vrai'].includes(t) ? true : ['false', '0', 'non', 'faux'].includes(t) ? false : String(v);
+  }
+  if (type === 'Any') return typeof v === 'object' ? JSON.stringify(v) : v;
+  return toText(v);
+}
+
+// Forme canonique d'une valeur de clé, pour comparer la source et Grist quel que soit le type (1, 1.0 et "1")
+const canon = (v: any) => (v === null || v === undefined ? '' : String(v));
+
+// Type Grist d'une colonne d'après le profil data.gouv (csv-detective) ; texte par défaut, pour ne rien altérer
+const GRIST_TYPE: Record<string, string> = { int: 'Int', float: 'Numeric', bool: 'Bool' };
+
+async function sha1(text: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -179,12 +204,66 @@ export async function removeSync(rowId: number): Promise<void> {
 
 // --- Bilan ---
 
+const fmt = (n: number) => n.toLocaleString('fr-FR');
+
 export function formatStats(st: SyncStats): string {
-  const parts = [`${st.added} ajoutée(s)`, `${st.updated} mise(s) à jour`, `${st.unchanged} inchangée(s)`];
-  if (st.removed !== null) parts.push(`${st.removed} supprimée(s)`);
-  let msg = `${st.rows} lignes lues dans la source : ${parts.join(', ')}.`;
-  if (st.truncated) msg += ` Import limité à ${MAX_PAGES} pages : suppression des lignes absentes non effectuée.`;
+  const parts = [`${fmt(st.added)} ajoutée(s)`, `${fmt(st.updated)} mise(s) à jour`, `${fmt(st.unchanged)} inchangée(s)`];
+  if (st.removed !== null) parts.push(`${fmt(st.removed)} supprimée(s)`);
+  const total = st.total ?? st.rows;
+  let msg = `${fmt(total)} lignes sur data.gouv.fr : ${parts.join(', ')}.`;
+  if (st.truncated) {
+    msg += ` Seules les ${fmt(st.rows)} premières ont été lues (limite du widget) : suppression des lignes absentes non effectuée.`;
+  }
   return msg;
+}
+
+// --- Lecture de la source ---
+
+async function fetchJson(url: string) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Erreur de l'API tabulaire data.gouv (${resp.status}).`);
+  return resp.json();
+}
+
+// Types des colonnes source (profil csv-detective) ; vide si indisponible
+async function sourceTypes(resourceId: string): Promise<Record<string, string>> {
+  try {
+    const p = await fetchJson(`${TABULAR_API}/api/resources/${resourceId}/profile/`);
+    const cols: Record<string, any> = p?.profile?.columns ?? {};
+    return Object.fromEntries(Object.entries(cols).map(([k, v]) => [k, GRIST_TYPE[v?.python_type] ?? 'Text']));
+  } catch {
+    return {};
+  }
+}
+
+async function readSource(resourceId: string, onProgress: Progress) {
+  const rows: any[] = [];
+  let total = 0;
+  const pages = () => Math.max(1, Math.ceil(Math.min(total, MAX_ROWS) / PAGE_SIZE));
+  for (let page = 1; page <= pages(); page++) {
+    const result = await fetchJson(
+      `${TABULAR_API}/api/resources/${resourceId}/data/?page_size=${PAGE_SIZE}&page=${page}`,
+    );
+    total = result.meta?.total ?? 0;
+    const data: any[] = result.data ?? [];
+    rows.push(...data);
+    onProgress('lecture', page, pages());
+    if (data.length < PAGE_SIZE) break; // dernière page
+  }
+  return { rows: rows.slice(0, MAX_ROWS), total: Math.max(total, rows.length) };
+}
+
+// Types des colonnes de la table Grist (métadonnées du document)
+async function columnTypes(table: string): Promise<Record<string, string>> {
+  const docApi = grist().docApi;
+  const tables = await docApi.fetchTable('_grist_Tables');
+  const ref = (tables.id as number[])[(tables.tableId as string[]).indexOf(table)];
+  const cols = await docApi.fetchTable('_grist_Tables_column');
+  const out: Record<string, string> = {};
+  (cols.id as number[]).forEach((_, i) => {
+    if (cols.parentId[i] === ref) out[cols.colId[i]] = String(cols.type[i]).split(':')[0];
+  });
+  return out;
 }
 
 // --- Synchronisation ---
@@ -198,17 +277,33 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
   // En mode empreinte, une ligne modifiée devient une nouvelle ligne : l'ancienne doit disparaître
   const deleteMissing = hashMode || cfg.deleteMissing;
 
-  // 1. Colonnes techniques ; les colonnes existantes sont conservées
-  const existingCols = new Set(Object.keys(await docApi.fetchTable(table)));
-  const addColumn = async (colId: string, colInfo: object): Promise<string> => {
+  // 1. Lecture complète de la source, avant toute écriture
+  const [{ rows, total }, srcTypes] = await Promise.all([
+    readSource(cfg.resourceId, onProgress),
+    sourceTypes(cfg.resourceId),
+  ]);
+  const truncated = total > rows.length;
+  const srcCols = Object.keys(rows[0] ?? {})
+    .filter((src) => src !== '__id' && toGristColId(src) !== 'id')
+    .sort();
+  const colIdOf: Record<string, string> = Object.fromEntries(srcCols.map((src) => [src, toGristColId(src)]));
+
+  if (!hashMode) {
+    const missing = keys.filter((k) => !Object.values(colIdOf).includes(k));
+    if (missing.length) throw new Error(`Colonne(s) clé introuvable(s) dans la source : ${missing.join(', ')}`);
+  }
+
+  // 2. Colonnes : on conserve l'existant et on ajoute ce qui manque, avec un type explicite
+  //    (sans type, Grist devine : « 01004 » deviendrait le nombre 1004)
+  const types = await columnTypes(table);
+  const addColumn = async (colId: string, colInfo: { type: string; [k: string]: unknown }): Promise<string> => {
     // AddVisibleColumn : ajoute la colonne et l'affiche dans les vues de la table
     const r = await docApi.applyUserActions([['AddVisibleColumn', table, colId, colInfo]]);
     const newId: string = r.retValues[0].colId;
-    existingCols.add(newId);
+    types[newId] = colInfo.type.split(':')[0];
     return newId;
   };
-
-  if (!existingCols.has(MAJ_COL)) {
+  if (!(MAJ_COL in types)) {
     // NOW() recalculé à la création de la ligne et à chaque modification réelle d'une de ses cellules.
     // Grist ignore les mises à jour sans changement de valeur : une ligne identique garde son horodatage.
     await addColumn(MAJ_COL, {
@@ -218,72 +313,71 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
       recalcWhen: RECALC_MANUAL_UPDATES,
     });
   }
-  if (hashMode && !existingCols.has(HASH_COL)) {
-    await addColumn(HASH_COL, { type: 'Text', isFormula: false });
+  if (hashMode && !(HASH_COL in types)) await addColumn(HASH_COL, { type: 'Text', isFormula: false });
+  for (const src of srcCols) {
+    const colId = colIdOf[src];
+    if (colId in types) continue;
+    const type = keys.includes(colId) ? 'Text' : (srcTypes[src] ?? 'Text');
+    colIdOf[src] = await addColumn(colId, { type, isFormula: false });
+  }
+
+  // 3. Clés de rapprochement
+  const keyValues: any[][] = []; // par ligne, valeurs des colonnes clés (au type de la colonne)
+  const occurrences = new Map<string, number>();
+  for (const item of rows) {
+    if (hashMode) {
+      // Empreinte du contenu ; les lignes strictement identiques sont numérotées pour rester distinctes
+      const h = await sha1(JSON.stringify(srcCols.map((k) => toCell(item[k]))));
+      const n = occurrences.get(h) ?? 0;
+      occurrences.set(h, n + 1);
+      keyValues.push([n === 0 ? h : `${h}-${n + 1}`]);
+    } else {
+      const srcOf = (k: string) => srcCols.find((src) => colIdOf[src] === k)!;
+      keyValues.push(keys.map((k) => coerce(item[srcOf(k)], types[k])));
+    }
+  }
+  const keyIds = keyValues.map((kv) => JSON.stringify(kv.map(canon)));
+  if (!hashMode) {
+    const count = new Map<string, number>();
+    for (const id of keyIds) count.set(id, (count.get(id) ?? 0) + 1);
+    const dups = [...count].filter(([, n]) => n > 1);
+    if (dups.length) {
+      const examples = dups.slice(0, 3).map(([id, n]) => `${(JSON.parse(id) as string[]).join(' + ') || '(vide)'} ×${n}`);
+      throw new Error(
+        `La clé ${keys.join(' + ')} n'est pas unique : ${fmt(dups.length)} valeur(s) en double dans la source ` +
+          `(ex. : ${examples.join(', ')}). Rien n'a été modifié. Ajoutez une colonne à la clé ou choisissez la clé générée.`,
+      );
+    }
   }
 
   // État avant import : sert à compter ajouts (nouvel id) et mises à jour (date maj_datagouv changée)
   const before = await docApi.fetchTable(table);
   const majBefore = new Map<number, unknown>((before.id as number[]).map((rid, i) => [rid, before[MAJ_COL]?.[i]]));
 
-  // 2. Pages de l'API tabulaire → BulkAddOrUpdateRecord
-  const colIdOf: Record<string, string> = {}; // nom source -> id de colonne Grist
-  const seen = new Set<string>();
-  let rows = 0;
-  let totalPages = 1;
-
-  for (let page = 1; page <= Math.min(totalPages, MAX_PAGES); page++) {
-    const resp = await fetch(
-      `${TABULAR_API}/api/resources/${cfg.resourceId}/data/?page_size=${PAGE_SIZE}&page=${page}`,
-    );
-    if (!resp.ok) throw new Error(`Erreur de l'API tabulaire data.gouv (${resp.status}).`);
-    const result = await resp.json();
-    totalPages = Math.max(1, Math.ceil((result.meta?.total ?? 0) / PAGE_SIZE));
-    onProgress(page, Math.min(totalPages, MAX_PAGES));
-    const data: any[] = result.data ?? [];
-    if (data.length === 0) break;
-
-    for (const item of data) {
-      for (const src of Object.keys(item)) {
-        if (src === '__id' || src in colIdOf) continue;
-        const colId = toGristColId(src);
-        if (colId === 'id') continue;
-        // Colonne vide (comme le widget d'origine) : Grist la transforme en colonne de données au premier remplissage
-        colIdOf[src] = existingCols.has(colId)
-          ? colId
-          : await addColumn(colId, { isFormula: true, type: 'Any', formula: '' });
-      }
-    }
-    if (!hashMode) {
-      const missing = keys.filter((k) => !Object.values(colIdOf).includes(k));
-      if (missing.length) throw new Error(`Colonne(s) clé introuvable(s) dans la source : ${missing.join(', ')}`);
-    }
-
-    const srcCols = Object.keys(colIdOf).sort();
+  // 4. Écriture par lots → BulkAddOrUpdateRecord
+  for (let start = 0; start < rows.length; start += WRITE_BATCH) {
+    const batch = rows.slice(start, start + WRITE_BATCH);
     const require: Record<string, any[]> = Object.fromEntries(keys.map((k) => [k, []]));
     const values: Record<string, any[]> = {};
-    for (const item of data) {
-      if (hashMode) require[HASH_COL].push(await rowHash(item, srcCols));
-      for (const [src, colId] of Object.entries(colIdOf)) {
-        const v = toCell(item[src]);
-        if (keys.includes(colId)) require[colId].push(v);
-        else (values[colId] ??= []).push(v);
+    batch.forEach((item, j) => {
+      keys.forEach((k, ki) => require[k].push(keyValues[start + j][ki]));
+      for (const src of srcCols) {
+        const colId = colIdOf[src];
+        if (!keys.includes(colId)) (values[colId] ??= []).push(coerce(item[src], types[colId]));
       }
-      seen.add(JSON.stringify(keys.map((k) => require[k][require[k].length - 1])));
-    }
-
+    });
     await docApi.applyUserActions([['BulkAddOrUpdateRecord', table, require, values, { on_many: 'first' }]]);
-    rows += data.length;
+    onProgress('écriture', Math.min(start + WRITE_BATCH, rows.length), rows.length);
   }
 
-  // 3. Suppression des lignes disparues de la source (seulement si tout a été lu) et bilan
-  const truncated = totalPages > MAX_PAGES;
+  // 5. Suppression des lignes disparues de la source (seulement si tout a été lu) et bilan
+  const seen = new Set(keyIds);
   const current = await docApi.fetchTable(table);
   const removedIds = new Set<number>();
   let removed: number | null = null;
   if (deleteMissing && !truncated) {
     (current.id as number[]).forEach((rid, i) => {
-      if (!seen.has(JSON.stringify(keys.map((k) => current[k][i])))) removedIds.add(rid);
+      if (!seen.has(JSON.stringify(keys.map((k) => canon(current[k][i]))))) removedIds.add(rid);
     });
     if (removedIds.size) await docApi.applyUserActions([['BulkRemoveRecord', table, [...removedIds]]]);
     removed = removedIds.size;
@@ -299,5 +393,5 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
     else unchanged++;
   });
 
-  return { rows, added, updated, unchanged, removed, truncated };
+  return { total, rows: rows.length, added, updated, unchanged, removed, truncated };
 }

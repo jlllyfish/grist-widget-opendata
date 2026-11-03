@@ -20,7 +20,7 @@ Dérivé de [datagouv/grist-plugin-opendata](https://github.com/datagouv/grist-p
   quand data.gouv.fr a publié une version plus récente que la dernière mise à jour.
   Supprimer une ligne de `Synchro_datagouv` revient à « oublier » la synchronisation.
 
-Limite : 50 pages de 200 lignes (10 000 lignes) par ressource.
+Limite : 50 000 lignes par ressource. La source est lue en entier avant toute écriture ; une clé non unique est refusée sans rien modifier. Les colonnes créées sont typées d'après le profil data.gouv.fr (texte par défaut : les codes à zéro initial sont préservés).
 
 ## Installation dans Grist
 

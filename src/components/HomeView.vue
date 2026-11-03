@@ -102,8 +102,11 @@ async function refresh(s: SavedSync) {
   errors.value[s.table] = false;
   status.value[s.table] = 'Mise à jour en cours…';
   try {
-    const st = await runSync(s, (page, total) => {
-      status.value[s.table] = `Mise à jour en cours… page ${page} / ${total}`;
+    const st = await runSync(s, (phase, done, total) => {
+      status.value[s.table] =
+        phase === 'lecture'
+          ? `Lecture des données data.gouv.fr… page ${done} / ${total}`
+          : `Écriture dans Grist… ${done.toLocaleString('fr-FR')} / ${total.toLocaleString('fr-FR')} lignes`;
     });
     await saveSync(s, st);
     status.value[s.table] = '✅ ' + formatStats(st);

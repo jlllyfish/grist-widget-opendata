@@ -157,8 +157,11 @@
     <!-- Import en cours -->
     <section v-if="step === 'running'">
       <p>Import en cours dans la table <strong>{{ finalTable || newTableName }}</strong>…</p>
-      <progress class="progress" :value="progress.page" :max="progress.total"></progress>
-      <p class="fr-text--sm">Page {{ progress.page }} / {{ progress.total }}</p>
+      <progress class="progress" :value="progress.done" :max="progress.total"></progress>
+      <p class="fr-text--sm">
+        <template v-if="progress.phase === 'lecture'">Lecture des données data.gouv.fr : page {{ progress.done }} / {{ progress.total }}</template>
+        <template v-else>Écriture dans Grist : {{ progress.done.toLocaleString('fr-FR') }} / {{ progress.total.toLocaleString('fr-FR') }} lignes</template>
+      </p>
     </section>
 
     <!-- Terminé -->
@@ -305,7 +308,7 @@ const keyColumns = ref<string[]>([]);
 const deleteMissing = ref(false);
 
 // --- Import ---
-const progress = ref({ page: 0, total: 1 });
+const progress = ref<{ phase: 'lecture' | 'écriture'; done: number; total: number }>({ phase: 'lecture', done: 0, total: 1 });
 const stats = ref<SyncStats | null>(null);
 const finalTable = ref('');
 let createdTable = ''; // évite de recréer la table si on relance après une erreur
@@ -313,7 +316,7 @@ watch(newTableName, () => (createdTable = ''));
 
 async function start() {
   error.value = '';
-  progress.value = { page: 0, total: 1 };
+  progress.value = { phase: 'lecture', done: 0, total: 1 };
   step.value = 'running';
   try {
     let table = existingTable.value;
@@ -330,7 +333,7 @@ async function start() {
       keys: keyMode.value === 'columns' ? [...keyColumns.value] : [],
       deleteMissing: deleteMissing.value,
     };
-    stats.value = await runSync(cfg, (page, total) => (progress.value = { page, total }));
+    stats.value = await runSync(cfg, (phase, done, total) => (progress.value = { phase, done, total }));
     await saveSync(cfg, stats.value);
     step.value = 'done';
   } catch (e: any) {
