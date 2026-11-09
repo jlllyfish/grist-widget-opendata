@@ -132,7 +132,7 @@
             Ex. : SIRET, code INSEE, UAI. Cochez plusieurs colonnes si c'est leur combinaison qui est unique.
           </span>
         </legend>
-        <div v-for="col in columns" :key="col" class="fr-fieldset__element fr-fieldset__element--inline">
+        <div v-for="col in keyCandidates" :key="col" class="fr-fieldset__element fr-fieldset__element--inline">
           <div class="fr-checkbox-group fr-checkbox-group--sm">
             <input :id="'col-' + col" v-model="keyColumns" type="checkbox" :value="col" />
             <label class="fr-label" :for="'col-' + col">{{ col }}</label>
@@ -143,6 +143,23 @@
         <input id="delete-missing" v-model="deleteMissing" type="checkbox" />
         <label class="fr-label" for="delete-missing">Supprimer les lignes de la table absentes de la source</label>
       </div>
+
+      <fieldset class="fr-fieldset">
+        <legend class="fr-fieldset__legend--regular fr-fieldset__legend">
+          Colonnes à ignorer pour détecter les changements
+          <span class="fr-hint-text">
+            Elles sont importées, mais leur changement ne compte pas : la ligne garde sa date dans {{ MAJ_COL }}. Utile
+            pour une date de publication qui change sur toutes les lignes à chaque mise à jour.
+            <template v-if="suggestedIgnore.length">Proposé automatiquement : {{ suggestedIgnore.join(', ') }}.</template>
+          </span>
+        </legend>
+        <div v-for="col in columns" :key="'ign-' + col" class="fr-fieldset__element fr-fieldset__element--inline">
+          <div class="fr-checkbox-group fr-checkbox-group--sm">
+            <input :id="'ign-' + col" v-model="ignoredColumns" type="checkbox" :value="col" :disabled="keyMode === 'columns' && keyColumns.includes(col)" />
+            <label class="fr-label" :for="'ign-' + col">{{ col }}</label>
+          </div>
+        </div>
+      </fieldset>
 
       <ul class="fr-btns-group fr-btns-group--inline-sm">
         <li><button class="fr-btn fr-btn--secondary" @click="step = 'destination'">Précédent</button></li>
@@ -181,9 +198,10 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { resolveUrl, searchResources, sourceColumns, type Resource } from '../datagouv';
+import { resolveUrl, searchResources, sourceSample, type Resource } from '../datagouv';
 import {
   HASH_COL,
+  MAJ_COL,
   createTable,
   formatStats,
   loadSyncs,
@@ -262,6 +280,7 @@ async function submitUrl() {
 
 const resource = ref<Resource | null>(null);
 const columns = ref<string[]>([]);
+const suggestedIgnore = ref<string[]>([]);
 const resourceLabel = computed(() =>
   resource.value ? [resource.value.datasetTitle, resource.value.title].filter(Boolean).join(' — ') : '',
 );
@@ -269,9 +288,12 @@ const resourceLabel = computed(() =>
 async function pickResource(r: Resource) {
   error.value = '';
   try {
-    columns.value = await sourceColumns(r.id);
+    const sample = await sourceSample(r.id);
+    columns.value = sample.columns;
+    suggestedIgnore.value = sample.suggestedIgnore;
     resource.value = r;
     keyColumns.value = [];
+    ignoredColumns.value = [...sample.suggestedIgnore];
     newTableName.value = toGristTableId(r.datasetTitle || r.title).slice(0, 40);
     tables.value = await window.grist.docApi.listTables();
     step.value = 'destination';
@@ -297,6 +319,7 @@ async function goToKey() {
       keyMode.value = prev.keyMode;
       keyColumns.value = [...prev.keys];
       deleteMissing.value = prev.deleteMissing;
+      if (prev.ignored?.length) ignoredColumns.value = [...prev.ignored];
     }
   }
   step.value = 'key';
@@ -306,6 +329,9 @@ async function goToKey() {
 const keyMode = ref<KeyMode>('columns');
 const keyColumns = ref<string[]>([]);
 const deleteMissing = ref(false);
+const ignoredColumns = ref<string[]>([]);
+// Une colonne ignorée ne peut pas servir de clé
+const keyCandidates = computed(() => columns.value.filter((c) => !ignoredColumns.value.includes(c)));
 
 // --- Import ---
 const progress = ref<{ phase: 'lecture' | 'écriture'; done: number; total: number }>({ phase: 'lecture', done: 0, total: 1 });
@@ -332,6 +358,7 @@ async function start() {
       keyMode: keyMode.value,
       keys: keyMode.value === 'columns' ? [...keyColumns.value] : [],
       deleteMissing: deleteMissing.value,
+      ignored: ignoredColumns.value.filter((c) => keyMode.value === 'hash' || !keyColumns.value.includes(c)),
     };
     stats.value = await runSync(cfg, (phase, done, total) => (progress.value = { phase, done, total }));
     await saveSync(cfg, stats.value);

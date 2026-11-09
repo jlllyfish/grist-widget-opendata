@@ -22,6 +22,7 @@
             {{ s.resourceTitle || s.resourceId }}<br />
             <span class="fr-text--xs">
               Clé : {{ s.keyMode === 'hash' ? 'empreinte générée' : s.keys.join(' + ') }}
+              <template v-if="s.ignored?.length"> · Ignorées : {{ s.ignored.join(', ') }}</template>
               · Dernière mise à jour : {{ s.lastRun ? formatDate(s.lastRun) : '—' }}
             </span>
           </p>

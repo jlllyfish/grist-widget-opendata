@@ -59,9 +59,17 @@ export async function resolveUrl(url: string): Promise<Resource[]> {
   throw new Error("URL non reconnue : collez l'adresse d'un jeu de données ou d'une ressource data.gouv.fr.");
 }
 
-// Colonnes de la ressource (lues sur sa première ligne), au format des identifiants Grist
-export async function sourceColumns(resourceId: string): Promise<string[]> {
-  const resp = await fetch(`${TABULAR_API}/api/resources/${resourceId}/data/?page_size=1`);
+export interface SourceSample {
+  columns: string[]; // identifiants Grist des colonnes de la ressource
+  suggestedIgnore: string[]; // colonnes à ignorer par défaut pour détecter les changements
+}
+
+const looksLikeDate = (v: unknown) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
+
+// Colonnes de la ressource, lues sur un échantillon de 200 lignes. Une colonne de date identique sur tout
+// l'échantillon (ex. date_jeu_donnees) change en général à chaque publication : on propose de l'ignorer.
+export async function sourceSample(resourceId: string): Promise<SourceSample> {
+  const resp = await fetch(`${TABULAR_API}/api/resources/${resourceId}/data/?page_size=200`);
   if (!resp.ok) {
     throw new Error(
       resp.status === 404
@@ -69,11 +77,12 @@ export async function sourceColumns(resourceId: string): Promise<string[]> {
         : `Erreur de l'API tabulaire data.gouv (${resp.status}).`,
     );
   }
-  const sample = await resp.json();
-  return Object.keys(sample.data?.[0] ?? {})
-    .filter((k) => k !== '__id')
-    .map(toGristColId)
-    .filter((k) => k !== 'id');
+  const rows: any[] = (await resp.json()).data ?? [];
+  const src = Object.keys(rows[0] ?? {}).filter((k) => k !== '__id' && toGristColId(k) !== 'id');
+  const suggestedIgnore = src
+    .filter((k) => rows.length > 1 && looksLikeDate(rows[0][k]) && rows.every((r) => r[k] === rows[0][k]))
+    .map(toGristColId);
+  return { columns: src.map(toGristColId), suggestedIgnore };
 }
 
 // Date de dernière modification de la ressource sur data.gouv.fr (null si inconnue)

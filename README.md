@@ -14,7 +14,10 @@ Dérivé de [datagouv/grist-plugin-opendata](https://github.com/datagouv/grist-p
   - *Clé générée* (source sans identifiant) : empreinte du contenu stockée dans `cle_datagouv` ; une ligne modifiée est
     remplacée et les lignes disparues sont supprimées.
 - **Horodatage** : la colonne `maj_datagouv` (formule déclenchée `NOW()`) indique la date de création ou de dernière
-  modification de chaque ligne.
+  modification de chaque ligne. Elle ne surveille que les colonnes de la source.
+- **Colonnes ignorées** : leur changement ne compte pas (ni pour `maj_datagouv`, ni pour l'empreinte). Le widget propose
+  automatiquement les colonnes de date identiques sur toutes les lignes, comme `date_jeu_donnees`, qui changent à
+  chaque publication.
 - Les synchronisations sont mémorisées dans le document, dans la table technique `Synchro_datagouv` (visible dans
   « Données brutes », sans page). Elles sont listées sur l'accueil avec un bouton « Mettre à jour », et un badge signale
   quand data.gouv.fr a publié une version plus récente que la dernière mise à jour.

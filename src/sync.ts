@@ -9,7 +9,8 @@ export const HASH_COL = 'cle_datagouv';
 export const MAX_ROWS = 50_000; // lignes lues au maximum par ressource
 const PAGE_SIZE = 200; // lignes par requête à l'API tabulaire
 const WRITE_BATCH = 500; // lignes par écriture dans Grist
-const RECALC_MANUAL_UPDATES = 2; // RecalcWhen.MANUAL_UPDATES côté Grist
+// RecalcWhen.DEFAULT côté Grist : calcul à la création de la ligne, puis quand une colonne de recalcDeps change
+const RECALC_DEFAULT = 0;
 const OPTION_KEY = 'syncs'; // ancien stockage (options du widget), relu une fois pour migration
 // Table technique (sans page) où sont mémorisées les synchronisations : ce sont des données du document,
 // enregistrées immédiatement, contrairement aux options du widget qui exigent un clic sur « Enregistrer ».
@@ -24,6 +25,9 @@ export interface SyncConfig {
   keyMode: KeyMode;
   keys: string[]; // colonnes Grist servant de clé (mode 'columns')
   deleteMissing: boolean;
+  // Colonnes Grist ignorées pour détecter les changements (ex. date_jeu_donnees, qui change à chaque publication) :
+  // elles sont importées, mais ne modifient ni maj_datagouv ni l'empreinte
+  ignored?: string[];
 }
 
 export interface SavedSync extends SyncConfig {
@@ -115,13 +119,24 @@ const STORE_COLUMNS: [string, object][] = [
   ['Mode_cle', { type: 'Text' }],
   ['Cles', { type: 'Text' }], // liste JSON
   ['Supprimer_absentes', { type: 'Bool' }],
+  ['Ignorees', { type: 'Text' }], // liste JSON
   ['Derniere_maj', { type: 'DateTime:Europe/Paris' }],
   ['Bilan', { type: 'Text' }],
 ];
 
 async function ensureStoreTable(): Promise<void> {
   const tables: string[] = await grist().docApi.listTables();
-  if (tables.includes(STORE_TABLE)) return;
+  if (tables.includes(STORE_TABLE)) {
+    // Table créée par une version précédente : on ajoute les colonnes apparues depuis
+    const existing = Object.keys(await grist().docApi.fetchTable(STORE_TABLE));
+    const missing = STORE_COLUMNS.filter(([id]) => !existing.includes(id));
+    if (missing.length) {
+      await grist().docApi.applyUserActions(
+        missing.map(([id, info]) => ['AddColumn', STORE_TABLE, id, { isFormula: false, ...info }]),
+      );
+    }
+    return;
+  }
   // AddRawTable : table visible dans « Données brutes » uniquement, sans page ; on remplace ses colonnes A, B, C
   await grist().docApi.applyUserActions([
     ['AddRawTable', STORE_TABLE],
@@ -158,6 +173,7 @@ async function readStore(): Promise<Record<string, SavedSync>> {
       keyMode: t.Mode_cle?.[i] === 'hash' ? 'hash' : 'columns',
       keys: parseKeys(t.Cles?.[i]),
       deleteMissing: Boolean(t.Supprimer_absentes?.[i]),
+      ignored: parseKeys(t.Ignorees?.[i]),
       lastRun: typeof ts === 'number' ? new Date(ts * 1000).toISOString() : null,
       lastReport: t.Bilan?.[i] || '',
     };
@@ -174,6 +190,7 @@ export async function saveSync(cfg: SyncConfig, stats?: SyncStats): Promise<void
     Mode_cle: [cfg.keyMode],
     Cles: [JSON.stringify(cfg.keys)],
     Supprimer_absentes: [cfg.deleteMissing],
+    Ignorees: [JSON.stringify(cfg.ignored ?? [])],
   };
   if (stats) {
     values.Derniere_maj = [Date.now() / 1000];
@@ -253,15 +270,31 @@ async function readSource(resourceId: string, onProgress: Progress) {
   return { rows: rows.slice(0, MAX_ROWS), total: Math.max(total, rows.length) };
 }
 
-// Types des colonnes de la table Grist (métadonnées du document)
-async function columnTypes(table: string): Promise<Record<string, string>> {
+interface ColumnMeta {
+  ref: number;
+  type: string;
+  recalcWhen?: number;
+  recalcDeps?: number[];
+}
+
+// RefList encodée par Grist : ['L', 1, 2, …]
+const refList = (v: unknown): number[] => (Array.isArray(v) ? v.filter((x): x is number => typeof x === 'number') : []);
+
+// Colonnes de la table Grist (métadonnées du document)
+async function columnMeta(table: string): Promise<Record<string, ColumnMeta>> {
   const docApi = grist().docApi;
   const tables = await docApi.fetchTable('_grist_Tables');
   const ref = (tables.id as number[])[(tables.tableId as string[]).indexOf(table)];
   const cols = await docApi.fetchTable('_grist_Tables_column');
-  const out: Record<string, string> = {};
-  (cols.id as number[]).forEach((_, i) => {
-    if (cols.parentId[i] === ref) out[cols.colId[i]] = String(cols.type[i]).split(':')[0];
+  const out: Record<string, ColumnMeta> = {};
+  (cols.id as number[]).forEach((colRef, i) => {
+    if (cols.parentId[i] !== ref) return;
+    out[cols.colId[i]] = {
+      ref: colRef,
+      type: String(cols.type[i]).split(':')[0],
+      recalcWhen: cols.recalcWhen?.[i],
+      recalcDeps: refList(cols.recalcDeps?.[i]),
+    };
   });
   return out;
 }
@@ -274,6 +307,7 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
   const table = cfg.table;
   const hashMode = cfg.keyMode === 'hash';
   const keys = hashMode ? [HASH_COL] : [...cfg.keys];
+  const ignored = new Set(cfg.ignored ?? []);
   // En mode empreinte, une ligne modifiée devient une nouvelle ligne : l'ancienne doit disparaître
   const deleteMissing = hashMode || cfg.deleteMissing;
 
@@ -295,22 +329,24 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
 
   // 2. Colonnes : on conserve l'existant et on ajoute ce qui manque, avec un type explicite
   //    (sans type, Grist devine : « 01004 » deviendrait le nombre 1004)
-  const types = await columnTypes(table);
+  const meta = await columnMeta(table);
+  const types: Record<string, string> = Object.fromEntries(Object.entries(meta).map(([k, m]) => [k, m.type]));
   const addColumn = async (colId: string, colInfo: { type: string; [k: string]: unknown }): Promise<string> => {
     // AddVisibleColumn : ajoute la colonne et l'affiche dans les vues de la table
     const r = await docApi.applyUserActions([['AddVisibleColumn', table, colId, colInfo]]);
-    const newId: string = r.retValues[0].colId;
+    const { colId: newId, colRef } = r.retValues[0];
     types[newId] = colInfo.type.split(':')[0];
+    meta[newId] = { ref: colRef, type: types[newId] };
     return newId;
   };
   if (!(MAJ_COL in types)) {
-    // NOW() recalculé à la création de la ligne et à chaque modification réelle d'une de ses cellules.
-    // Grist ignore les mises à jour sans changement de valeur : une ligne identique garde son horodatage.
+    // Formule déclenchée NOW() : calculée à la création de la ligne, puis quand une colonne surveillée change
+    // (liste fixée plus bas). Grist ignore les écritures sans changement : une ligne identique garde sa date.
     await addColumn(MAJ_COL, {
       type: 'DateTime:Europe/Paris',
       isFormula: false,
       formula: 'NOW()',
-      recalcWhen: RECALC_MANUAL_UPDATES,
+      recalcWhen: RECALC_DEFAULT,
     });
   }
   if (hashMode && !(HASH_COL in types)) await addColumn(HASH_COL, { type: 'Text', isFormula: false });
@@ -321,13 +357,28 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
     colIdOf[src] = await addColumn(colId, { type, isFormula: false });
   }
 
+  // maj_datagouv ne surveille que les colonnes de la source non ignorées (pas les colonnes ajoutées à la main)
+  const watched = srcCols
+    .map((src) => colIdOf[src])
+    .filter((c) => !ignored.has(c))
+    .map((c) => meta[c].ref)
+    .sort((a, b) => a - b);
+  const majMeta = meta[MAJ_COL];
+  if (majMeta.recalcWhen !== RECALC_DEFAULT || JSON.stringify(majMeta.recalcDeps ?? []) !== JSON.stringify(watched)) {
+    // Même action que l'interface de Grist (panneau « formule déclenchée »)
+    await docApi.applyUserActions([
+      ['UpdateRecord', '_grist_Tables_column', majMeta.ref, { recalcWhen: RECALC_DEFAULT, recalcDeps: ['L', ...watched] }],
+    ]);
+  }
+
   // 3. Clés de rapprochement
+  const hashCols = srcCols.filter((src) => !ignored.has(colIdOf[src]));
   const keyValues: any[][] = []; // par ligne, valeurs des colonnes clés (au type de la colonne)
   const occurrences = new Map<string, number>();
   for (const item of rows) {
     if (hashMode) {
-      // Empreinte du contenu ; les lignes strictement identiques sont numérotées pour rester distinctes
-      const h = await sha1(JSON.stringify(srcCols.map((k) => toCell(item[k]))));
+      // Empreinte du contenu (hors colonnes ignorées) ; les lignes identiques sont numérotées pour rester distinctes
+      const h = await sha1(JSON.stringify(hashCols.map((k) => toCell(item[k]))));
       const n = occurrences.get(h) ?? 0;
       occurrences.set(h, n + 1);
       keyValues.push([n === 0 ? h : `${h}-${n + 1}`]);
