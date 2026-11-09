@@ -15,6 +15,11 @@ Dérivé de [datagouv/grist-plugin-opendata](https://github.com/datagouv/grist-p
     remplacée et les lignes disparues sont supprimées.
 - **Horodatage** : la colonne `maj_datagouv` (formule déclenchée `NOW()`) indique la date de création ou de dernière
   modification de chaque ligne. Elle ne surveille que les colonnes de la source.
+- **Filtre** (facultatif) : une condition sur une colonne (égal à, parmi, contient, différent de), appliquée par
+  l'API data.gouv.fr et conservée pour les mises à jour. Les lignes hors filtre sont retirées de la table (clé générée
+  ou option « supprimer les absentes »). Un filtre qui ne renvoie aucune ligne est refusé.
+- **Compteurs** : l'accueil affiche le nombre de lignes sur data.gouv.fr (après filtre, et au total) et dans la table.
+  Le bouton « Modifier » rouvre l'assistant sur les réglages de la synchronisation.
 - **Colonnes ignorées** : leur changement ne compte pas (ni pour `maj_datagouv`, ni pour l'empreinte). Le widget propose
   automatiquement les colonnes de date identiques sur toutes les lignes, comme `date_jeu_donnees`, qui changent à
   chaque publication.

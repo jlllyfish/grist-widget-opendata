@@ -18,6 +18,41 @@ export const STORE_TABLE = 'Synchro_datagouv';
 
 export type KeyMode = 'columns' | 'hash';
 
+// Filtre appliqué côté data.gouv (API tabulaire) avant import
+export type FilterOp = 'exact' | 'in' | 'contains' | 'differs';
+export interface SyncFilter {
+  column: string; // nom de la colonne dans la source
+  op: FilterOp;
+  value: string; // pour 'in' : valeurs séparées par « ; »
+}
+
+export const FILTER_OPS: Record<FilterOp, string> = {
+  exact: 'est égal à',
+  in: 'est parmi (valeurs séparées par ;)',
+  contains: 'contient',
+  differs: 'est différent de',
+};
+
+const inValues = (value: string) =>
+  value
+    .split(';')
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+// Paramètre de requête de l'API tabulaire (ex. uai_insee_reg__exact=76) ; chaîne vide si pas de filtre
+export function filterQuery(f?: SyncFilter | null): string {
+  if (!f?.column || !f.value.trim()) return '';
+  const value =
+    f.op === 'in' ? inValues(f.value).map((v) => `"${v.replace(/"/g, '')}"`).join(',') : f.value.trim();
+  return `${encodeURIComponent(f.column)}__${f.op}=${encodeURIComponent(value)}`;
+}
+
+export function filterLabel(f?: SyncFilter | null): string {
+  if (!f?.column || !f.value.trim()) return '';
+  const value = f.op === 'in' ? inValues(f.value).join(', ') : f.value.trim();
+  return `${f.column} ${FILTER_OPS[f.op].replace(/ \(.*\)$/, '')} ${value}`;
+}
+
 export interface SyncConfig {
   table: string;
   resourceId: string;
@@ -28,6 +63,7 @@ export interface SyncConfig {
   // Colonnes Grist ignorées pour détecter les changements (ex. date_jeu_donnees, qui change à chaque publication) :
   // elles sont importées, mais ne modifient ni maj_datagouv ni l'empreinte
   ignored?: string[];
+  filter?: SyncFilter | null;
 }
 
 export interface SavedSync extends SyncConfig {
@@ -44,6 +80,7 @@ export interface SyncStats {
   unchanged: number;
   removed: number | null; // null : suppression non demandée ou impossible (import tronqué)
   truncated: boolean;
+  filter?: string; // libellé du filtre appliqué
 }
 
 export type Progress = (phase: 'lecture' | 'écriture', done: number, total: number) => void;
@@ -120,6 +157,7 @@ const STORE_COLUMNS: [string, object][] = [
   ['Cles', { type: 'Text' }], // liste JSON
   ['Supprimer_absentes', { type: 'Bool' }],
   ['Ignorees', { type: 'Text' }], // liste JSON
+  ['Filtre', { type: 'Text' }], // objet JSON (SyncFilter)
   ['Derniere_maj', { type: 'DateTime:Europe/Paris' }],
   ['Bilan', { type: 'Text' }],
 ];
@@ -145,6 +183,15 @@ async function ensureStoreTable(): Promise<void> {
     ['RemoveColumn', STORE_TABLE, 'C'],
     ...STORE_COLUMNS.map(([id, info]) => ['AddColumn', STORE_TABLE, id, { isFormula: false, ...info }]),
   ]);
+}
+
+function parseFilter(v: unknown): SyncFilter | null {
+  try {
+    const f = JSON.parse(String(v ?? 'null'));
+    return f && typeof f.column === 'string' && typeof f.value === 'string' && f.op in FILTER_OPS ? f : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseKeys(v: unknown): string[] {
@@ -174,6 +221,7 @@ async function readStore(): Promise<Record<string, SavedSync>> {
       keys: parseKeys(t.Cles?.[i]),
       deleteMissing: Boolean(t.Supprimer_absentes?.[i]),
       ignored: parseKeys(t.Ignorees?.[i]),
+      filter: parseFilter(t.Filtre?.[i]),
       lastRun: typeof ts === 'number' ? new Date(ts * 1000).toISOString() : null,
       lastReport: t.Bilan?.[i] || '',
     };
@@ -191,6 +239,7 @@ export async function saveSync(cfg: SyncConfig, stats?: SyncStats): Promise<void
     Cles: [JSON.stringify(cfg.keys)],
     Supprimer_absentes: [cfg.deleteMissing],
     Ignorees: [JSON.stringify(cfg.ignored ?? [])],
+    Filtre: [filterLabel(cfg.filter) ? JSON.stringify(cfg.filter) : ''],
   };
   if (stats) {
     values.Derniere_maj = [Date.now() / 1000];
@@ -227,7 +276,7 @@ export function formatStats(st: SyncStats): string {
   const parts = [`${fmt(st.added)} ajoutée(s)`, `${fmt(st.updated)} mise(s) à jour`, `${fmt(st.unchanged)} inchangée(s)`];
   if (st.removed !== null) parts.push(`${fmt(st.removed)} supprimée(s)`);
   const total = st.total ?? st.rows;
-  let msg = `${fmt(total)} lignes sur data.gouv.fr : ${parts.join(', ')}.`;
+  let msg = `${fmt(total)} lignes sur data.gouv.fr${st.filter ? ` (filtre : ${st.filter})` : ''} : ${parts.join(', ')}.`;
   if (st.truncated) {
     msg += ` Seules les ${fmt(st.rows)} premières ont été lues (limite du widget) : suppression des lignes absentes non effectuée.`;
   }
@@ -253,13 +302,14 @@ async function sourceTypes(resourceId: string): Promise<Record<string, string>> 
   }
 }
 
-async function readSource(resourceId: string, onProgress: Progress) {
+async function readSource(resourceId: string, filter: SyncFilter | null | undefined, onProgress: Progress) {
+  const q = filterQuery(filter);
   const rows: any[] = [];
   let total = 0;
   const pages = () => Math.max(1, Math.ceil(Math.min(total, MAX_ROWS) / PAGE_SIZE));
   for (let page = 1; page <= pages(); page++) {
     const result = await fetchJson(
-      `${TABULAR_API}/api/resources/${resourceId}/data/?page_size=${PAGE_SIZE}&page=${page}`,
+      `${TABULAR_API}/api/resources/${resourceId}/data/?page_size=${PAGE_SIZE}&page=${page}${q ? '&' + q : ''}`,
     );
     total = result.meta?.total ?? 0;
     const data: any[] = result.data ?? [];
@@ -313,10 +363,18 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
 
   // 1. Lecture complète de la source, avant toute écriture
   const [{ rows, total }, srcTypes] = await Promise.all([
-    readSource(cfg.resourceId, onProgress),
+    readSource(cfg.resourceId, cfg.filter, onProgress),
     sourceTypes(cfg.resourceId),
   ]);
   const truncated = total > rows.length;
+  if (!rows.length) {
+    // Garde-fou : une source vide (ou un filtre trop strict) viderait la table
+    throw new Error(
+      filterLabel(cfg.filter)
+        ? `Le filtre « ${filterLabel(cfg.filter)} » ne renvoie aucune ligne : rien n'a été modifié.`
+        : "La ressource ne contient aucune ligne : rien n'a été modifié.",
+    );
+  }
   const srcCols = Object.keys(rows[0] ?? {})
     .filter((src) => src !== '__id' && toGristColId(src) !== 'id')
     .sort();
@@ -444,5 +502,5 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
     else unchanged++;
   });
 
-  return { total, rows: rows.length, added, updated, unchanged, removed, truncated };
+  return { total, rows: rows.length, added, updated, unchanged, removed, truncated, filter: filterLabel(cfg.filter) || undefined };
 }

@@ -23,6 +23,7 @@
             <span class="fr-text--xs">
               Clé : {{ s.keyMode === 'hash' ? 'empreinte générée' : s.keys.join(' + ') }}
               <template v-if="s.ignored?.length"> · Ignorées : {{ s.ignored.join(', ') }}</template>
+              <template v-if="filterLabel(s.filter)"><br />Filtre : {{ filterLabel(s.filter) }}</template>
               · Dernière mise à jour : {{ s.lastRun ? formatDate(s.lastRun) : '—' }}
             </span>
           </p>
@@ -32,8 +33,18 @@
             </p>
             <p v-else-if="s.lastRun && checked[s.table]" class="fr-badge fr-badge--sm fr-badge--success">À jour</p>
           </div>
-          <div v-if="status[s.table] || s.lastReport" class="fr-card__end">
-            <p class="fr-text--sm fr-mb-0" :class="{ 'fr-error-text': errors[s.table] }">
+          <div class="fr-card__end">
+            <p class="fr-text--sm fr-mb-1w counts">
+              <span>
+                data.gouv.fr :
+                <strong>{{ apiCount[s.table] != null ? fmt(apiCount[s.table]!) : '…' }}</strong> lignes
+                <template v-if="filterLabel(s.filter) && apiTotal[s.table] != null">(sur {{ fmt(apiTotal[s.table]!) }} au total)</template>
+              </span>
+              <span>
+                Table Grist : <strong>{{ gristCount[s.table] != null ? fmt(gristCount[s.table]!) : '…' }}</strong> lignes
+              </span>
+            </p>
+            <p v-if="status[s.table] || s.lastReport" class="fr-text--sm fr-mb-0" :class="{ 'fr-error-text': errors[s.table] }">
               {{ status[s.table] || 'Dernier bilan : ' + s.lastReport }}
             </p>
           </div>
@@ -51,6 +62,11 @@
               </button>
             </li>
             <li>
+              <button class="fr-btn fr-btn--secondary fr-icon-settings-5-line" :disabled="running !== null" @click="$emit('edit', s)">
+                Modifier
+              </button>
+            </li>
+            <li>
               <button class="fr-btn fr-btn--tertiary" :disabled="running !== null" @click="forget(s)">Oublier</button>
             </li>
           </ul>
@@ -62,10 +78,29 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { resourceLastModified } from '../datagouv';
-import { STORE_TABLE, formatStats, loadSyncs, removeSync, runSync, saveSync, type SavedSync } from '../sync';
+import { countRows, resourceLastModified } from '../datagouv';
+import { STORE_TABLE, filterLabel, formatStats, loadSyncs, removeSync, runSync, saveSync, type SavedSync } from '../sync';
 
-defineEmits<{ import: [] }>();
+defineEmits<{ import: []; edit: [sync: SavedSync] }>();
+
+const apiCount = ref<Record<string, number | null>>({}); // lignes sur data.gouv.fr (après filtre)
+const apiTotal = ref<Record<string, number | null>>({}); // lignes sur data.gouv.fr (sans filtre)
+const gristCount = ref<Record<string, number | null>>({});
+const fmt = (n: number) => n.toLocaleString('fr-FR');
+
+async function loadCounts(s: SavedSync) {
+  const [filtered, total] = await Promise.all([
+    countRows(s.resourceId, s.filter),
+    filterLabel(s.filter) ? countRows(s.resourceId) : Promise.resolve(null),
+  ]);
+  apiCount.value[s.table] = filtered;
+  apiTotal.value[s.table] = total;
+  try {
+    gristCount.value[s.table] = ((await window.grist.docApi.fetchTable(s.table)).id as number[]).length;
+  } catch {
+    gristCount.value[s.table] = null; // table supprimée ou renommée
+  }
+}
 
 const syncs = ref<SavedSync[]>([]);
 const loaded = ref(false);
@@ -95,7 +130,7 @@ async function reload() {
     loadError.value = `Impossible de lire la table ${STORE_TABLE} : ${e?.message ?? e}`;
   }
   loaded.value = true;
-  await Promise.all(syncs.value.map(checkFreshness));
+  await Promise.all(syncs.value.flatMap((s) => [checkFreshness(s), loadCounts(s)]));
 }
 
 async function refresh(s: SavedSync) {
@@ -130,6 +165,11 @@ onMounted(reload);
 </script>
 
 <style scoped>
+.counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.5rem;
+}
 .home-top {
   display: flex;
   flex-wrap: wrap;

@@ -92,11 +92,78 @@
       </fieldset>
       <ul class="fr-btns-group fr-btns-group--inline-sm">
         <li><button class="fr-btn fr-btn--secondary" @click="step = 'source'">Précédent</button></li>
-        <li><button class="fr-btn" :disabled="!destinationValid" @click="goToKey">Suivant</button></li>
+        <li><button class="fr-btn" :disabled="!destinationValid" @click="goToFilter">Suivant</button></li>
       </ul>
     </section>
 
-    <!-- 3. Clé de rapprochement -->
+    <!-- 3. Filtre -->
+    <section v-if="step === 'filter'">
+      <p class="fr-text--sm">
+        Ressource : <strong>{{ resourceLabel }}</strong><br />
+        <span v-if="totalRows !== null">{{ totalRows.toLocaleString('fr-FR') }} lignes sur data.gouv.fr</span>
+      </p>
+      <fieldset class="fr-fieldset">
+        <legend class="fr-fieldset__legend--regular fr-fieldset__legend">
+          Importer seulement une partie des lignes (facultatif)
+          <span class="fr-hint-text">
+            Le filtre est appliqué par data.gouv.fr et conservé pour les mises à jour suivantes.
+          </span>
+        </legend>
+        <div class="fr-fieldset__element">
+          <div class="fr-radio-group">
+            <input id="filter-none" v-model="filterOn" type="radio" :value="false" />
+            <label class="fr-label" for="filter-none">Toutes les lignes</label>
+          </div>
+        </div>
+        <div class="fr-fieldset__element">
+          <div class="fr-radio-group">
+            <input id="filter-on" v-model="filterOn" type="radio" :value="true" />
+            <label class="fr-label" for="filter-on">Seulement les lignes où…</label>
+          </div>
+        </div>
+        <div v-if="filterOn" class="fr-fieldset__element indent filter-grid">
+          <div class="fr-select-group">
+            <label class="fr-label" for="filter-col">Colonne</label>
+            <select id="filter-col" v-model="filterCol" class="fr-select">
+              <option value="" disabled>Choisir une colonne</option>
+              <option v-for="c in columns" :key="c" :value="c">{{ c }}</option>
+            </select>
+          </div>
+          <div class="fr-select-group">
+            <label class="fr-label" for="filter-op">Condition</label>
+            <select id="filter-op" v-model="filterOp" class="fr-select">
+              <option v-for="(label, op) in FILTER_OPS" :key="op" :value="op">{{ label }}</option>
+            </select>
+          </div>
+          <div class="fr-input-group">
+            <label class="fr-label" for="filter-value">
+              Valeur
+              <span v-if="filterOp === 'in'" class="fr-hint-text">Ex. : 76;75</span>
+            </label>
+            <input id="filter-value" v-model="filterValue" class="fr-input" list="filter-values" autocomplete="off" />
+            <datalist id="filter-values">
+              <option v-for="v in sampleValues[filterCol] ?? []" :key="v" :value="v"></option>
+            </datalist>
+          </div>
+        </div>
+        <p v-if="filterOn && currentFilter" class="fr-text--sm fr-mb-0 indent" :class="{ 'fr-error-text': filteredRows === 0 }">
+          <template v-if="counting">Comptage…</template>
+          <template v-else-if="filteredRows !== null">
+            → {{ filteredRows.toLocaleString('fr-FR') }} ligne(s) correspondent au filtre
+          </template>
+        </p>
+      </fieldset>
+      <ul class="fr-btns-group fr-btns-group--inline-sm">
+        <li><button class="fr-btn fr-btn--secondary" :disabled="isEdit" @click="step = 'destination'">Précédent</button></li>
+        <li>
+          <button class="fr-btn" :disabled="filterOn && (!currentFilter || filteredRows === 0)" @click="step = 'key'">
+            Suivant
+          </button>
+        </li>
+      </ul>
+    </section>
+
+    <!-- 4. Clé de rapprochement -->
     <section v-if="step === 'key'">
       <fieldset class="fr-fieldset">
         <legend class="fr-fieldset__legend--regular fr-fieldset__legend">
@@ -162,10 +229,10 @@
       </fieldset>
 
       <ul class="fr-btns-group fr-btns-group--inline-sm">
-        <li><button class="fr-btn fr-btn--secondary" @click="step = 'destination'">Précédent</button></li>
+        <li><button class="fr-btn fr-btn--secondary" @click="step = 'filter'">Précédent</button></li>
         <li>
           <button class="fr-btn" :disabled="keyMode === 'columns' && !keyColumns.length" @click="start">
-            Lancer l'import
+            {{ isEdit ? 'Enregistrer et mettre à jour' : "Lancer l'import" }}
           </button>
         </li>
       </ul>
@@ -197,9 +264,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
-import { resolveUrl, searchResources, sourceSample, type Resource } from '../datagouv';
+import { computed, onMounted, ref, watch } from 'vue';
+import { countRows, resolveUrl, searchResources, sourceSample, type Resource } from '../datagouv';
 import {
+  FILTER_OPS,
   HASH_COL,
   MAJ_COL,
   createTable,
@@ -209,17 +277,24 @@ import {
   saveSync,
   STORE_TABLE,
   toGristTableId,
+  type FilterOp,
   type KeyMode,
+  type SavedSync,
   type SyncConfig,
+  type SyncFilter,
   type SyncStats,
 } from '../sync';
 
+const props = defineProps<{ edit?: SavedSync | null }>();
 const emit = defineEmits<{ home: [] }>();
+const isEdit = computed(() => Boolean(props.edit));
 
-type Step = 'source' | 'destination' | 'key' | 'running' | 'done';
-const STEPS = ['Choisir les données', 'Choisir la table', 'Rapprocher les lignes'];
+type Step = 'source' | 'destination' | 'filter' | 'key' | 'running' | 'done';
+const STEPS = ['Choisir les données', 'Choisir la table', 'Filtrer les lignes', 'Rapprocher les lignes'];
 const step = ref<Step>('source');
-const stepIndex = computed(() => ({ source: 1, destination: 2, key: 3 } as Record<string, number>)[step.value] ?? 0);
+const stepIndex = computed(
+  () => ({ source: 1, destination: 2, filter: 3, key: 4 } as Record<string, number>)[step.value] ?? 0,
+);
 const error = ref('');
 
 // --- 1. Ressource ---
@@ -281,6 +356,19 @@ async function submitUrl() {
 const resource = ref<Resource | null>(null);
 const columns = ref<string[]>([]);
 const suggestedIgnore = ref<string[]>([]);
+const sourceNames = ref<Record<string, string>>({});
+const sampleValues = ref<Record<string, string[]>>({});
+const totalRows = ref<number | null>(null);
+
+async function loadSample(resourceId: string) {
+  const sample = await sourceSample(resourceId);
+  columns.value = sample.columns;
+  suggestedIgnore.value = sample.suggestedIgnore;
+  sourceNames.value = sample.sourceNames;
+  sampleValues.value = sample.values;
+  totalRows.value = await countRows(resourceId);
+  return sample;
+}
 const resourceLabel = computed(() =>
   resource.value ? [resource.value.datasetTitle, resource.value.title].filter(Boolean).join(' — ') : '',
 );
@@ -288,12 +376,12 @@ const resourceLabel = computed(() =>
 async function pickResource(r: Resource) {
   error.value = '';
   try {
-    const sample = await sourceSample(r.id);
-    columns.value = sample.columns;
-    suggestedIgnore.value = sample.suggestedIgnore;
+    const sample = await loadSample(r.id);
     resource.value = r;
     keyColumns.value = [];
     ignoredColumns.value = [...sample.suggestedIgnore];
+    filterOn.value = false;
+    filterValue.value = '';
     newTableName.value = toGristTableId(r.datasetTitle || r.title).slice(0, 40);
     tables.value = await window.grist.docApi.listTables();
     step.value = 'destination';
@@ -311,19 +399,70 @@ const destinationValid = computed(() =>
   destination.value === 'new' ? newTableName.value.trim() !== '' : existingTable.value !== '',
 );
 
-async function goToKey() {
+function applySettings(prev: SavedSync) {
+  keyMode.value = prev.keyMode;
+  keyColumns.value = [...prev.keys];
+  deleteMissing.value = prev.deleteMissing;
+  if (prev.ignored?.length) ignoredColumns.value = [...prev.ignored];
+  if (prev.filter) {
+    filterOn.value = true;
+    filterCol.value = Object.keys(sourceNames.value).find((id) => sourceNames.value[id] === prev.filter!.column) ?? '';
+    filterOp.value = prev.filter.op;
+    filterValue.value = prev.filter.value;
+  }
+}
+
+async function goToFilter() {
   // Table déjà synchronisée avec cette ressource : on reprend ses réglages
   if (destination.value === 'existing') {
     const prev = (await loadSyncs())[existingTable.value];
-    if (prev && prev.resourceId === resource.value?.id) {
-      keyMode.value = prev.keyMode;
-      keyColumns.value = [...prev.keys];
-      deleteMissing.value = prev.deleteMissing;
-      if (prev.ignored?.length) ignoredColumns.value = [...prev.ignored];
-    }
+    if (prev && prev.resourceId === resource.value?.id) applySettings(prev);
   }
-  step.value = 'key';
+  step.value = 'filter';
 }
+
+// --- 3. Filtre ---
+const filterOn = ref(false);
+const filterCol = ref('');
+const filterOp = ref<FilterOp>('exact');
+const filterValue = ref('');
+const filteredRows = ref<number | null>(null);
+const counting = ref(false);
+const currentFilter = computed<SyncFilter | null>(() =>
+  filterOn.value && filterCol.value && filterValue.value.trim()
+    ? { column: sourceNames.value[filterCol.value] ?? filterCol.value, op: filterOp.value, value: filterValue.value.trim() }
+    : null,
+);
+let countTimer: number | undefined;
+watch(currentFilter, (f) => {
+  window.clearTimeout(countTimer);
+  filteredRows.value = null;
+  if (!f || !resource.value) return;
+  counting.value = true;
+  countTimer = window.setTimeout(async () => {
+    const n = await countRows(resource.value!.id, f);
+    if (JSON.stringify(f) === JSON.stringify(currentFilter.value)) {
+      filteredRows.value = n;
+      counting.value = false;
+    }
+  }, 400);
+});
+
+// Mode « Modifier » : on ouvre directement l'étape filtre de la synchronisation existante
+onMounted(async () => {
+  const e = props.edit;
+  if (!e) return;
+  try {
+    await loadSample(e.resourceId);
+    resource.value = { id: e.resourceId, title: e.resourceTitle || e.resourceId, datasetTitle: '' };
+    destination.value = 'existing';
+    existingTable.value = e.table;
+    applySettings(e);
+    step.value = 'filter';
+  } catch (err: any) {
+    error.value = err?.message;
+  }
+});
 
 // --- 3. Clé ---
 const keyMode = ref<KeyMode>('columns');
@@ -359,6 +498,7 @@ async function start() {
       keys: keyMode.value === 'columns' ? [...keyColumns.value] : [],
       deleteMissing: deleteMissing.value,
       ignored: ignoredColumns.value.filter((c) => keyMode.value === 'hash' || !keyColumns.value.includes(c)),
+      filter: currentFilter.value,
     };
     stats.value = await runSync(cfg, (phase, done, total) => (progress.value = { phase, done, total }));
     await saveSync(cfg, stats.value);
@@ -382,6 +522,11 @@ async function start() {
 }
 .indent {
   padding-left: 2rem;
+}
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0 1rem;
 }
 .progress {
   width: 100%;

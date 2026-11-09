@@ -1,5 +1,5 @@
 // Recherche de ressources tabulaires sur data.gouv.fr (API publique, sans authentification).
-import { TABULAR_API, toGristColId } from './sync';
+import { TABULAR_API, filterQuery, toGristColId, type SyncFilter } from './sync';
 
 export const DATAGOUV_URL = import.meta.env.VUE_APP_DATAGOUV_IMPORT_URL || 'https://www.data.gouv.fr';
 
@@ -61,28 +61,57 @@ export async function resolveUrl(url: string): Promise<Resource[]> {
 
 export interface SourceSample {
   columns: string[]; // identifiants Grist des colonnes de la ressource
+  sourceNames: Record<string, string>; // identifiant Grist -> nom de la colonne dans la source
+  values: Record<string, string[]>; // identifiant Grist -> valeurs distinctes de l'échantillon (pour les filtres)
   suggestedIgnore: string[]; // colonnes à ignorer par défaut pour détecter les changements
 }
 
 const looksLikeDate = (v: unknown) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
 
-// Colonnes de la ressource, lues sur un échantillon de 200 lignes. Une colonne de date identique sur tout
-// l'échantillon (ex. date_jeu_donnees) change en général à chaque publication : on propose de l'ignorer.
-export async function sourceSample(resourceId: string): Promise<SourceSample> {
-  const resp = await fetch(`${TABULAR_API}/api/resources/${resourceId}/data/?page_size=200`);
+async function tabularData(resourceId: string, query: string) {
+  const resp = await fetch(`${TABULAR_API}/api/resources/${resourceId}/data/?${query}`);
   if (!resp.ok) {
     throw new Error(
       resp.status === 404
         ? "Ressource absente de l'API tabulaire data.gouv (elle n'a peut-être pas encore été analysée)."
-        : `Erreur de l'API tabulaire data.gouv (${resp.status}).`,
+        : resp.status === 400
+          ? "Filtre refusé par l'API tabulaire data.gouv : vérifiez la colonne et la valeur."
+          : `Erreur de l'API tabulaire data.gouv (${resp.status}).`,
     );
   }
-  const rows: any[] = (await resp.json()).data ?? [];
+  return resp.json();
+}
+
+// Colonnes de la ressource, lues sur un échantillon de 200 lignes. Une colonne de date identique sur tout
+// l'échantillon (ex. date_jeu_donnees) change en général à chaque publication : on propose de l'ignorer.
+export async function sourceSample(resourceId: string): Promise<SourceSample> {
+  const rows: any[] = (await tabularData(resourceId, 'page_size=200')).data ?? [];
   const src = Object.keys(rows[0] ?? {}).filter((k) => k !== '__id' && toGristColId(k) !== 'id');
   const suggestedIgnore = src
     .filter((k) => rows.length > 1 && looksLikeDate(rows[0][k]) && rows.every((r) => r[k] === rows[0][k]))
     .map(toGristColId);
-  return { columns: src.map(toGristColId), suggestedIgnore };
+  const values: Record<string, string[]> = {};
+  for (const k of src) {
+    const distinct = [...new Set(rows.map((r) => r[k]).filter((v) => v !== null && v !== '').map(String))];
+    values[toGristColId(k)] = distinct.sort((a, b) => a.localeCompare(b, 'fr')).slice(0, 100);
+  }
+  return {
+    columns: src.map(toGristColId),
+    sourceNames: Object.fromEntries(src.map((k) => [toGristColId(k), k])),
+    values,
+    suggestedIgnore,
+  };
+}
+
+// Nombre de lignes de la ressource sur data.gouv.fr, éventuellement après filtre (null si indisponible)
+export async function countRows(resourceId: string, filter?: SyncFilter | null): Promise<number | null> {
+  try {
+    const q = filterQuery(filter);
+    const result = await tabularData(resourceId, `page_size=1${q ? '&' + q : ''}`);
+    return typeof result.meta?.total === 'number' ? result.meta.total : null;
+  } catch {
+    return null;
+  }
 }
 
 // Date de dernière modification de la ressource sur data.gouv.fr (null si inconnue)
