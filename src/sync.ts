@@ -229,8 +229,9 @@ async function readStore(): Promise<Record<string, SavedSync>> {
   return out;
 }
 
-// Enregistre (ou met à jour) une synchronisation, avec le résultat de son dernier passage
-export async function saveSync(cfg: SyncConfig, stats?: SyncStats): Promise<void> {
+// Enregistre (ou met à jour) une synchronisation, avec le résultat de son dernier passage.
+// rowId : ligne existante à modifier (changement de table de destination) ; sinon, rapprochement par nom de table.
+export async function saveSync(cfg: SyncConfig, stats?: SyncStats, rowId?: number): Promise<void> {
   await ensureStoreTable();
   const values: Record<string, any[]> = {
     Ressource: [cfg.resourceId],
@@ -244,6 +245,11 @@ export async function saveSync(cfg: SyncConfig, stats?: SyncStats): Promise<void
   if (stats) {
     values.Derniere_maj = [Date.now() / 1000];
     values.Bilan = [formatStats(stats)];
+  }
+  if (rowId) {
+    const fields = Object.fromEntries(Object.entries(values).map(([k, v]) => [k, v[0]]));
+    await grist().docApi.applyUserActions([['UpdateRecord', STORE_TABLE, rowId, { Table: cfg.table, ...fields }]]);
+    return;
   }
   await grist().docApi.applyUserActions([
     ['BulkAddOrUpdateRecord', STORE_TABLE, { Table: [cfg.table] }, values, { on_many: 'first' }],

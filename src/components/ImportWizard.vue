@@ -62,7 +62,13 @@
     <section v-if="step === 'destination'">
       <p class="fr-text--sm">Ressource : <strong>{{ resourceLabel }}</strong></p>
       <fieldset class="fr-fieldset">
-        <legend class="fr-fieldset__legend--regular fr-fieldset__legend">Où importer les données ?</legend>
+        <legend class="fr-fieldset__legend--regular fr-fieldset__legend">
+          Où importer les données ?
+          <span v-if="edit" class="fr-hint-text">
+            Table actuelle : {{ edit.table }}. Si vous en choisissez une autre, {{ edit.table }} est conservée telle quelle
+            mais ne sera plus mise à jour.
+          </span>
+        </legend>
         <div class="fr-fieldset__element">
           <div class="fr-radio-group">
             <input id="dest-new" v-model="destination" type="radio" value="new" />
@@ -91,7 +97,7 @@
         </div>
       </fieldset>
       <ul class="fr-btns-group fr-btns-group--inline-sm">
-        <li><button class="fr-btn fr-btn--secondary" @click="step = 'source'">Précédent</button></li>
+        <li><button class="fr-btn fr-btn--secondary" :disabled="isEdit" @click="step = 'source'">Précédent</button></li>
         <li><button class="fr-btn" :disabled="!destinationValid" @click="goToFilter">Suivant</button></li>
       </ul>
     </section>
@@ -154,7 +160,7 @@
         </p>
       </fieldset>
       <ul class="fr-btns-group fr-btns-group--inline-sm">
-        <li><button class="fr-btn fr-btn--secondary" :disabled="isEdit" @click="step = 'destination'">Précédent</button></li>
+        <li><button class="fr-btn fr-btn--secondary" @click="step = 'destination'">Précédent</button></li>
         <li>
           <button class="fr-btn" :disabled="filterOn && (!currentFilter || filteredRows === 0)" @click="step = 'key'">
             Suivant
@@ -254,6 +260,10 @@
         <h3 class="fr-alert__title">Données importées dans la table {{ finalTable }}</h3>
         <p>{{ formatStats(stats) }}</p>
       </div>
+      <p v-if="edit && finalTable !== edit.table" class="fr-text--sm">
+        La synchronisation porte désormais sur {{ finalTable }}. L'ancienne table {{ edit.table }} est conservée, sans
+        mise à jour : vous pouvez la supprimer si elle ne sert plus.
+      </p>
       <p class="fr-text--sm">
         Cette synchronisation est mémorisée dans le document (table {{ STORE_TABLE }}) : vous la retrouverez sur l'accueil
         du widget pour la mettre à jour en un clic.
@@ -413,10 +423,19 @@ function applySettings(prev: SavedSync) {
 }
 
 async function goToFilter() {
-  // Table déjà synchronisée avec cette ressource : on reprend ses réglages
+  error.value = '';
   if (destination.value === 'existing') {
     const prev = (await loadSyncs())[existingTable.value];
-    if (prev && prev.resourceId === resource.value?.id) applySettings(prev);
+    const other = prev && prev.rowId !== props.edit?.rowId;
+    // Une table ne peut porter qu'une synchronisation : sinon les deux se mélangeraient
+    if (other && (isEdit.value || prev.resourceId !== resource.value?.id)) {
+      error.value =
+        `La table ${existingTable.value} est déjà synchronisée avec « ${prev.resourceTitle || prev.resourceId} ». ` +
+        'Choisissez une autre table ou une nouvelle table.';
+      return;
+    }
+    // Table déjà synchronisée avec cette ressource : on reprend ses réglages
+    if (other) applySettings(prev);
   }
   step.value = 'filter';
 }
@@ -448,7 +467,7 @@ watch(currentFilter, (f) => {
   }, 400);
 });
 
-// Mode « Modifier » : on ouvre directement l'étape filtre de la synchronisation existante
+// Mode « Modifier » : on ouvre l'étape « table » de la synchronisation existante, réglages repris
 onMounted(async () => {
   const e = props.edit;
   if (!e) return;
@@ -457,8 +476,10 @@ onMounted(async () => {
     resource.value = { id: e.resourceId, title: e.resourceTitle || e.resourceId, datasetTitle: '' };
     destination.value = 'existing';
     existingTable.value = e.table;
+    newTableName.value = toGristTableId(`${e.table}_bis`).slice(0, 40);
+    tables.value = await window.grist.docApi.listTables();
     applySettings(e);
-    step.value = 'filter';
+    step.value = 'destination';
   } catch (err: any) {
     error.value = err?.message;
   }
@@ -501,7 +522,7 @@ async function start() {
       filter: currentFilter.value,
     };
     stats.value = await runSync(cfg, (phase, done, total) => (progress.value = { phase, done, total }));
-    await saveSync(cfg, stats.value);
+    await saveSync(cfg, stats.value, props.edit?.rowId);
     step.value = 'done';
   } catch (e: any) {
     console.error(e);
