@@ -15,6 +15,10 @@ Dérivé de [datagouv/grist-plugin-opendata](https://github.com/datagouv/grist-p
     remplacée et les lignes disparues sont supprimées.
 - **Horodatage** : la colonne `maj_datagouv` (formule déclenchée `NOW()`) indique la date de création ou de dernière
   modification de chaque ligne. Elle ne surveille que les colonnes de la source.
+- **Statut** : la colonne `statut_datagouv` indique si la ligne a été *ajoutée* ou *modifiée* lors de la mise à jour
+  datée dans `maj_datagouv`. En mode clé générée, une ligne apparue est rapprochée de la ligne disparue qui lui
+  ressemble (contenu identique, ou au plus 1 colonne sur 5 différente, correspondance unique) : elle est mise à jour sur
+  place, ce qui conserve les références et les colonnes ajoutées à la main.
 - **Filtre** (facultatif) : une condition sur une colonne (égal à, parmi, contient, différent de), appliquée par
   l'API data.gouv.fr et conservée pour les mises à jour. Les lignes hors filtre sont retirées de la table (clé générée
   ou option « supprimer les absentes »). Un filtre qui ne renvoie aucune ligne est refusé.

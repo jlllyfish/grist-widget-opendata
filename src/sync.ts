@@ -6,6 +6,14 @@ export const TABULAR_API = import.meta.env.VUE_APP_DATAGOUV_TABULAR_API || 'http
 export const MAJ_COL = 'maj_datagouv';
 // Clé générée quand la source n'a pas d'identifiant : empreinte SHA-1 du contenu de la ligne
 export const HASH_COL = 'cle_datagouv';
+// Nature du dernier changement de chaque ligne : « ajoutée » ou « modifiée » (avec sa date dans maj_datagouv)
+export const STATUS_COL = 'statut_datagouv';
+const STATUS_CHOICES = {
+  choices: ['ajoutée', 'modifiée'],
+  choiceOptions: { ajoutée: { fillColor: '#B8F0C8' }, modifiée: { fillColor: '#FFE7A8' } },
+};
+// Rapprochement approché (mode empreinte) : au-delà de ce nombre de comparaisons, on s'en tient aux correspondances exactes
+const MAX_PAIR_COMPARISONS = 2_000_000;
 export const MAX_ROWS = 50_000; // lignes lues au maximum par ressource
 const PAGE_SIZE = 200; // lignes par requête à l'API tabulaire
 const WRITE_BATCH = 500; // lignes par écriture dans Grist
@@ -279,7 +287,7 @@ export async function removeSync(rowId: number): Promise<void> {
 const fmt = (n: number) => n.toLocaleString('fr-FR');
 
 export function formatStats(st: SyncStats): string {
-  const parts = [`${fmt(st.added)} ajoutée(s)`, `${fmt(st.updated)} mise(s) à jour`, `${fmt(st.unchanged)} inchangée(s)`];
+  const parts = [`${fmt(st.added)} ajoutée(s)`, `${fmt(st.updated)} modifiée(s)`, `${fmt(st.unchanged)} inchangée(s)`];
   if (st.removed !== null) parts.push(`${fmt(st.removed)} supprimée(s)`);
   const total = st.total ?? st.rows;
   let msg = `${fmt(total)} lignes sur data.gouv.fr${st.filter ? ` (filtre : ${st.filter})` : ''} : ${parts.join(', ')}.`;
@@ -355,6 +363,61 @@ async function columnMeta(table: string): Promise<Record<string, ColumnMeta>> {
   return out;
 }
 
+// --- Rapprochement des lignes disparues et apparues (mode empreinte) ---
+
+interface Sig {
+  id: number;
+  sig: string[];
+}
+
+// Associe chaque ligne apparue (id = index dans la source) à une ligne disparue (id = ligne Grist) :
+// 1. contenu identique sur les colonnes comparées (ex. après un changement des colonnes ignorées) ;
+// 2. sinon, au plus maxDiff colonnes différentes, à condition que la correspondance soit unique dans les deux sens.
+export function pairRows(gone: Sig[], fresh: Sig[], maxDiff: number): Map<number, number> {
+  const pairs = new Map<number, number>();
+  const byContent = new Map<string, number[]>();
+  for (const g of gone) {
+    const k = JSON.stringify(g.sig);
+    if (byContent.has(k)) byContent.get(k)!.push(g.id);
+    else byContent.set(k, [g.id]);
+  }
+  const used = new Set<number>();
+  const restFresh: Sig[] = [];
+  for (const f of fresh) {
+    const id = byContent.get(JSON.stringify(f.sig))?.shift();
+    if (id === undefined) restFresh.push(f);
+    else {
+      pairs.set(f.id, id);
+      used.add(id);
+    }
+  }
+  const restGone = gone.filter((g) => !used.has(g.id));
+  if (!restGone.length || !restFresh.length || restGone.length * restFresh.length > MAX_PAIR_COMPARISONS) return pairs;
+
+  const best = <T>() => new Map<number, { d: number; n: number; other: T }>();
+  const bestFresh = best<number>();
+  const bestGone = best<number>();
+  const keep = (m: Map<number, { d: number; n: number; other: number }>, id: number, d: number, other: number) => {
+    const b = m.get(id);
+    if (!b || d < b.d) m.set(id, { d, n: 1, other });
+    else if (d === b.d) b.n++;
+  };
+  for (const f of restFresh) {
+    for (const g of restGone) {
+      let d = 0;
+      for (let c = 0; c < f.sig.length && d <= maxDiff; c++) if (f.sig[c] !== g.sig[c]) d++;
+      if (d > maxDiff) continue;
+      keep(bestFresh, f.id, d, g.id);
+      keep(bestGone, g.id, d, f.id);
+    }
+  }
+  for (const [fid, b] of bestFresh) {
+    const g = bestGone.get(b.other)!;
+    if (b.n === 1 && g.n === 1 && g.other === fid) pairs.set(fid, b.other);
+  }
+  return pairs;
+}
+
 // --- Synchronisation ---
 
 export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}): Promise<SyncStats> {
@@ -414,6 +477,9 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
     });
   }
   if (hashMode && !(HASH_COL in types)) await addColumn(HASH_COL, { type: 'Text', isFormula: false });
+  if (!(STATUS_COL in types)) {
+    await addColumn(STATUS_COL, { type: 'Choice', isFormula: false, widgetOptions: JSON.stringify(STATUS_CHOICES) });
+  }
   for (const src of srcCols) {
     const colId = colIdOf[src];
     if (colId in types) continue;
@@ -469,6 +535,34 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
   const before = await docApi.fetchTable(table);
   const majBefore = new Map<number, unknown>((before.id as number[]).map((rid, i) => [rid, before[MAJ_COL]?.[i]]));
 
+  // Mode empreinte : une ligne modifiée dans la source a une nouvelle empreinte. On la rapproche de la ligne disparue
+  // qui lui ressemble pour la mettre à jour sur place (même ligne Grist : références et colonnes manuelles conservées).
+  if (hashMode && !truncated) {
+    const compared = hashCols.map((src) => colIdOf[src]);
+    const seenKeys = new Set(keyIds);
+    const gone = (before.id as number[])
+      .map((rowId, i) => ({ rowId, i }))
+      .filter(({ i }) => !seenKeys.has(JSON.stringify([canon(before[HASH_COL]?.[i])])));
+    const existingKeys = new Set((before[HASH_COL] ?? []).map((v: unknown) => canon(v)));
+    const fresh = rows
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ idx }) => !existingKeys.has(canon(keyValues[idx][0])));
+    const pairs = pairRows(
+      gone.map(({ rowId, i }) => ({ id: rowId, sig: compared.map((c) => canon(before[c]?.[i])) })),
+      fresh.map(({ item, idx }) => ({
+        id: idx,
+        sig: hashCols.map((src) => canon(coerce(item[src], types[colIdOf[src]]))),
+      })),
+      Math.max(1, Math.floor(compared.length / 5)),
+    );
+    if (pairs.size) {
+      // La ligne existante reçoit la nouvelle empreinte : l'écriture qui suit la met à jour au lieu d'en créer une
+      const rowIds = [...pairs.values()];
+      const hashes = [...pairs.keys()].map((idx) => keyValues[idx][0]);
+      await docApi.applyUserActions([['BulkUpdateRecord', table, rowIds, { [HASH_COL]: hashes }]]);
+    }
+  }
+
   // 4. Écriture par lots → BulkAddOrUpdateRecord
   for (let start = 0; start < rows.length; start += WRITE_BATCH) {
     const batch = rows.slice(start, start + WRITE_BATCH);
@@ -498,15 +592,23 @@ export async function runSync(cfgIn: SyncConfig, onProgress: Progress = () => {}
     removed = removedIds.size;
   }
 
-  let added = 0;
-  let updated = 0;
+  const addedIds: number[] = [];
+  const updatedIds: number[] = [];
   let unchanged = 0;
   (current.id as number[]).forEach((rid, i) => {
     if (removedIds.has(rid)) return;
-    if (!majBefore.has(rid)) added++;
-    else if (JSON.stringify(majBefore.get(rid)) !== JSON.stringify(current[MAJ_COL][i])) updated++;
+    if (!majBefore.has(rid)) addedIds.push(rid);
+    else if (JSON.stringify(majBefore.get(rid)) !== JSON.stringify(current[MAJ_COL][i])) updatedIds.push(rid);
     else unchanged++;
   });
+  // statut_datagouv n'est pas surveillée par maj_datagouv : l'écrire ne change pas les dates
+  const statusIds = [...addedIds, ...updatedIds];
+  if (statusIds.length) {
+    const statuses = [...addedIds.map(() => 'ajoutée'), ...updatedIds.map(() => 'modifiée')];
+    await docApi.applyUserActions([['BulkUpdateRecord', table, statusIds, { [STATUS_COL]: statuses }]]);
+  }
+  const added = addedIds.length;
+  const updated = updatedIds.length;
 
   return { total, rows: rows.length, added, updated, unchanged, removed, truncated, filter: filterLabel(cfg.filter) || undefined };
 }
